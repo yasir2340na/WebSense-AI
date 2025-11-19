@@ -1,0 +1,148 @@
+.App {
+  width: 380px;
+  padding: 20px;
+  text-align: center;
+  font-family: "Segoe UI", sans-serif;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  min-height: 500px;
+  max-height: 600px;
+  overflow-y: auto;
+}
+
+.App-header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.App-logo {
+  width: 60px;
+  height: 60px;
+  margin-bottom: 15px;
+}
+
+h1 {
+  margin: 0 0 10px 0;
+  font-size: 24px;
+  font-weight: 600;
+}
+
+p {
+  margin: 5px 0 20px 0;
+  font-size: 14px;
+  opacity: 0.9;
+}
+
+button {
+  background-color: white;
+  color: #667eea;
+  border: none;
+  padding: 12px 24px;
+  border-radius: 25px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 16px;
+  transition: all 0.3s ease;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+  width: 100%;
+  margin-bottom: 20px;
+}
+
+button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+}
+
+button.active {
+  background-color: #48bb78;
+  color: white;
+}
+
+.command-list {
+  background: rgba(255, 255, 255, 0.15);
+  padding: 15px;
+  border-radius: 15px;
+  margin-bottom: 15px;
+  text-align: left;
+  backdrop-filter: blur(10px);
+  max-height: 450px;
+  overflow-y: auto;
+}
+
+.command-list h3 {
+  margin: 0 0 15px 0;
+  font-size: 16px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.command-category {
+  margin-bottom: 15px;
+}
+
+.command-category h4 {
+  margin: 0 0 8px 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #ffd700;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+  padding-bottom: 5px;
+}
+
+.command-list ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.command-list li {
+  padding: 6px 10px;
+  margin: 4px 0;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+}
+
+.command-list li:before {
+  content: "▸";
+  margin-right: 8px;
+  font-size: 12px;
+  color: #48bb78;
+}
+
+.command-list .tip {
+  margin-top: 15px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 10px;
+  font-size: 12px;
+  text-align: center;
+  font-style: italic;
+  border: 1px dashed rgba(255, 255, 255, 0.3);
+}
+
+.status-indicator {
+  background: rgba(255, 255, 255, 0.2);
+  padding: 12px;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.status-indicator strong {
+  color: #48bb78;
+  font-size: 16px;
+}
+
+.toggle-btn {
+  background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+  color: white !important;
+}
+
+.toggle-btn.active {
+  background: linear-gradient(135deg, #f56565 0%, #c53030 100%);
+}
+

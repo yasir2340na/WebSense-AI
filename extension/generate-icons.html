@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Generate WebSense-AI Icons</title>
+</head>
+<body>
+    <h1>WebSense-AI Icon Generator</h1>
+    <p>Click the buttons below to download the icons:</p>
+    <button onclick="generateIcon(16)">Download 16x16</button>
+    <button onclick="generateIcon(48)">Download 48x48</button>
+    <button onclick="generateIcon(128)">Download 128x128</button>
+    
+    <div style="margin-top: 20px;">
+        <canvas id="canvas" style="border: 1px solid #ccc;"></canvas>
+    </div>
+
+    <script>
+        function generateIcon(size) {
+            const canvas = document.getElementById('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            
+            // Create gradient background
+            const gradient = ctx.createLinearGradient(0, 0, size, size);
+            gradient.addColorStop(0, '#4F46E5');
+            gradient.addColorStop(1, '#7C3AED');
+            
+            // Draw background circle
+            ctx.fillStyle = gradient;
+            ctx.beginPath();
+            ctx.arc(size/2, size/2, size/2 - 2, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Draw eye shape (white ellipse)
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+            ctx.beginPath();
+            ctx.ellipse(size/2, size/2, size * 0.27, size * 0.17, 0, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Draw pupil (dark circle)
+            ctx.fillStyle = '#4F46E5';
+            ctx.beginPath();
+            ctx.arc(size/2, size/2, size * 0.09, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Draw highlight (small white circle)
+            ctx.fillStyle = 'white';
+            ctx.beginPath();
+            ctx.arc(size/2, size/2, size * 0.047, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Draw AI wave lines if size is large enough
+            if (size >= 48) {
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+                ctx.lineWidth = Math.max(2, size / 42);
+                ctx.lineCap = 'round';
+                
+                // Left top wave
+                ctx.beginPath();
+                ctx.moveTo(size * 0.23, size * 0.39);
+                ctx.quadraticCurveTo(size * 0.27, size * 0.35, size * 0.31, size * 0.39);
+                ctx.stroke();
+                
+                // Right top wave
+                ctx.beginPath();
+                ctx.moveTo(size * 0.69, size * 0.39);
+                ctx.quadraticCurveTo(size * 0.73, size * 0.35, size * 0.77, size * 0.39);
+                ctx.stroke();
+                
+                // Left bottom wave
+                ctx.beginPath();
+                ctx.moveTo(size * 0.23, size * 0.61);
+                ctx.quadraticCurveTo(size * 0.27, size * 0.65, size * 0.31, size * 0.61);
+                ctx.stroke();
+                
+                // Right bottom wave
+                ctx.beginPath();
+                ctx.moveTo(size * 0.69, size * 0.61);
+                ctx.quadraticCurveTo(size * 0.73, size * 0.65, size * 0.77, size * 0.61);
+                ctx.stroke();
+            }
+            
+            // Download the image
+            canvas.toBlob(function(blob) {
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `icon${size}.png`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            });
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+{
+  "name": "websense-ai",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "cd extension && npm run dev",
+    "build": "cd extension && npm run build",
+    "preview": "cd extension && npm run preview",
+    "install:all": "npm install && cd extension && npm install && cd ../backend && npm install",
+    "extension:dev": "cd extension && npm run dev",
+    "extension:build": "cd extension && npm run build"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.0.0",
+    "vite": "^7.2.2"
+  }
+}
