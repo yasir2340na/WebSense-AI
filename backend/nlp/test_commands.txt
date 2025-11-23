@@ -1,0 +1,131 @@
+# Test commands for spaCy NLP accuracy validation
+
+# SHOW commands - element discovery
+show buttons
+show all buttons
+list the buttons
+could you show me buttons
+i want to see buttons
+display all clickable buttons
+give me a list of buttons
+
+show links
+show all links
+list links
+display the links on this page
+i want to see all the links
+
+show menus
+show all menus
+find menus
+display navigation menus
+where are the dropdowns
+
+show inputs
+show input fields
+list all text boxes
+find the form fields
+show me where i can type
+
+# CLICK commands
+click button
+click the button
+press button
+click first button
+click the first button
+press the last button
+click button three
+click the third button
+click button submit
+click the submit button
+press the cancel button
+
+click link
+click first link
+click the home link
+open the about link
+
+# SCROLL commands
+scroll down
+go down
+move down
+page down
+scroll up
+go up
+move up
+scroll to top
+go to the top
+scroll to bottom
+go to the bottom
+scroll left
+scroll right
+
+# NAVIGATION
+go back
+back
+previous page
+go forward
+forward
+next page
+reload
+refresh
+refresh page
+
+# TAB management
+new tab
+open new tab
+create a new tab
+close tab
+close this tab
+duplicate tab
+copy this tab
+clone the tab
+
+# ZOOM
+zoom in
+make it bigger
+enlarge
+zoom out
+make it smaller
+shrink the page
+reset zoom
+normal size
+
+# CONFIRMATION
+yes
+yeah
+yup
+sure
+okay
+no
+nope
+nah
+cancel
+
+# NUMBERS
+one
+two
+three
+four
+five
+1
+2
+3
+4
+5
+
+# HELP
+help
+what can you do
+show me commands
+how does this work
+
+# COMPLEX/NATURAL commands
+could you please show me all the buttons on this page
+i would like to see the links
+can you click the first button for me
+please scroll down a little bit
+i want to open a new tab
+would you mind closing this tab
+go back to the previous page please
+zoom in so i can see better
