@@ -1,0 +1,9 @@
+# Python dependencies for spaCy NLP server
+flask==3.0.0
+flask-cors==4.0.0
+spacy>=3.7.0
+
+# Note: After installing requirements, download the spaCy model:
+# python -m spacy download en_core_web_sm
+# or for better accuracy (larger model):
+# python -m spacy download en_core_web_md
