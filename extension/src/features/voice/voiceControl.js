@@ -2,13 +2,146 @@
 // It creates a floating UI and manages speech recognition.
 
 (function() {
-  // Ensure the script runs only once
-  if (window.ws_voice_injected) {
+  // CRITICAL: Prevent duplicate injections
+  if (window.wsVoiceControlActive) {
+    console.log("⚠️ Voice control already active, skipping duplicate injection");
     return;
   }
-  window.ws_voice_injected = true;
+  window.wsVoiceControlActive = true;
 
-  console.log("WebSense-AI Voice Control Injected");
+  // Cleanup function to properly stop everything
+  const cleanup = () => {
+    console.log("🧹 Cleaning up voice control");
+    if (window.wsRecognitionInstance) {
+      try {
+        window.wsRecognitionInstance.stop();
+        window.wsRecognitionInstance.abort();
+      } catch (e) {
+        console.log("Recognition cleanup error (normal):", e.message);
+      }
+      window.wsRecognitionInstance = null;
+    }
+    
+    // Cancel any speech
+    try {
+      window.speechSynthesis.cancel();
+    } catch (e) {
+      console.log("Speech cleanup error:", e.message);
+    }
+    
+    window.wsVoiceControlActive = false;
+  };
+
+  // Handle page navigation/unload - cleanup before page changes
+  window.addEventListener('beforeunload', () => {
+    console.log("📄 Page unloading - cleaning up voice control");
+    cleanup();
+  });
+  
+  // Also handle pagehide for better browser compatibility
+  window.addEventListener('pagehide', () => {
+    console.log("📄 Page hiding - cleaning up voice control");
+    cleanup();
+  });
+
+  // Remove old UI if exists (for re-injection on navigation)
+  const oldWrapper = document.getElementById('ws-voice-wrapper');
+  if (oldWrapper) {
+    console.log("🔄 Removing old voice control UI from previous page");
+    cleanup(); // Clean up old instance first
+    oldWrapper.remove();
+  }
+
+  console.log("WebSense-AI Voice Control Injected ✅");
+
+  // --- Enhanced Context Manager for Conversational Memory ---
+  const contextManager = {
+    lastAction: null,
+    lastTarget: null,
+    lastElements: [],
+    lastClickedElement: null, // Track last clicked element for "click it again"
+    lastSpokenText: null, // Track last TTS output for "what did you say"
+    recentPages: [],
+    conversationHistory: [],
+    pendingScrollDirection: null,
+    corrections: [], // Track user corrections like "no, not that one"
+    
+    remember(action, target, elements = [], metadata = {}) {
+      this.lastAction = action;
+      this.lastTarget = target;
+      this.lastElements = elements.slice(0, 10); // Keep max 10
+      
+      // Store clicked element reference
+      if (action === 'click' && elements.length > 0) {
+        this.lastClickedElement = elements[0];
+      }
+      
+      this.conversationHistory.push({
+        action,
+        target,
+        elementCount: elements.length,
+        metadata,
+        timestamp: Date.now()
+      });
+      
+      // Keep only last 30 interactions for better context
+      if (this.conversationHistory.length > 30) {
+        this.conversationHistory.shift();
+      }
+      
+      console.log('🧠 Context updated:', action, target, `(${elements.length} elements)`);
+    },
+    
+    rememberSpoken(text) {
+      this.lastSpokenText = text;
+    },
+    
+    addCorrection(correctionType, data) {
+      this.corrections.push({
+        type: correctionType,
+        data,
+        timestamp: Date.now()
+      });
+      if (this.corrections.length > 10) {
+        this.corrections.shift();
+      }
+    },
+    
+    getContext() {
+      return {
+        lastAction: this.lastAction,
+        lastTarget: this.lastTarget,
+        hasElements: this.lastElements.length > 0,
+        lastClickedElement: this.lastClickedElement,
+        lastSpokenText: this.lastSpokenText,
+        recentCommands: this.conversationHistory.slice(-5),
+        canRepeat: this.lastClickedElement !== null,
+        canCorrect: this.corrections.length > 0
+      };
+    },
+    
+    clear() {
+      this.lastAction = null;
+      this.lastTarget = null;
+      this.lastElements = [];
+      this.pendingScrollDirection = null;
+      // Keep lastClickedElement and corrections for references
+      console.log('🧹 Context partially cleared');
+    },
+    
+    fullClear() {
+      // Complete reset
+      this.lastAction = null;
+      this.lastTarget = null;
+      this.lastElements = [];
+      this.lastClickedElement = null;
+      this.lastSpokenText = null;
+      this.conversationHistory = [];
+      this.corrections = [];
+      this.pendingScrollDirection = null;
+      console.log('🧹 Context fully cleared');
+    }
+  };
 
   // --- UI Creation & Dragging ---
   const createUI = () => {
@@ -158,11 +291,49 @@
   let isDragging = false;
   let isSpeaking = false; // Track if TTS is currently speaking
   
+  // Load voices for speech synthesis
+  let voicesLoaded = false;
+  const loadVoices = () => {
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length > 0) {
+      voicesLoaded = true;
+      console.log("✅ Voices loaded:", voices.length);
+    }
+  };
+  
+  // Load voices on page load
+  if (window.speechSynthesis.onvoiceschanged !== undefined) {
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+  }
+  loadVoices(); // Try loading immediately
+  
   // Store detected elements for smart selection
   let awaitingSelection = false;
   let selectionType = '';
   let selectionContext = [];
   let pendingConfirmation = null; // Stores element waiting for user confirmation
+  
+  // Action history for undo/redo
+  const actionHistory = [];
+  const MAX_HISTORY = 20;
+  
+  const recordAction = (type, data) => {
+    actionHistory.push({
+      type,
+      data,
+      timestamp: Date.now()
+    });
+    if (actionHistory.length > MAX_HISTORY) {
+      actionHistory.shift();
+    }
+    console.log('📝 Recorded action:', type, data);
+  };
+  
+  // Backend API configuration
+  const BACKEND_API = 'http://localhost:3000/api/voice/parse';
+  const BACKEND_NAVIGATE_API = 'http://localhost:3000/api/voice/navigate';
+  const USE_NLP_BACKEND = true; // Set to false to use old pattern matching
+  const USE_SMART_NAVIGATE = true; // Use intelligent element matching with /navigate endpoint
 
   // Helper function to get visible, clickable elements
   const getVisibleElements = (selector) => {
@@ -176,6 +347,192 @@
              style.opacity !== '0';
     });
   };
+
+  // Cache for dynamic elements
+  let elementCache = {
+    buttons: [],
+    links: [],
+    clickables: [],
+    lastUpdate: 0
+  };
+
+  // MutationObserver to watch for dynamic DOM changes
+  const setupDOMObserver = () => {
+    const observer = new MutationObserver((mutations) => {
+      let shouldUpdate = false;
+      
+      for (const mutation of mutations) {
+        // Check if nodes were added or removed
+        if (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0) {
+          shouldUpdate = true;
+          break;
+        }
+        // Check if attributes changed on interactive elements
+        if (mutation.type === 'attributes' && mutation.target) {
+          const target = mutation.target;
+          if (target.matches('button, a, [role="button"], [onclick]')) {
+            shouldUpdate = true;
+            break;
+          }
+        }
+      }
+      
+      if (shouldUpdate) {
+        // Debounce cache updates to avoid excessive recomputation
+        const now = Date.now();
+        if (now - elementCache.lastUpdate > 500) {
+          console.log('🔄 DOM changed, updating element cache...');
+          updateElementCache();
+          elementCache.lastUpdate = now;
+        }
+      }
+    });
+    
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['style', 'class', 'hidden', 'disabled']
+    });
+    
+    console.log('👁️ MutationObserver activated for dynamic DOM watching');
+    return observer;
+  };
+
+  // Update element cache
+  const updateElementCache = () => {
+    elementCache.buttons = getVisibleElements('button, [role="button"], input[type="submit"], input[type="button"], .btn, [class*="button"]');
+    elementCache.links = getVisibleElements('a[href]');
+    elementCache.clickables = getVisibleElements('[onclick], [role="link"], [tabindex]:not([tabindex="-1"])');
+    console.log(`📦 Cache updated: ${elementCache.buttons.length} buttons, ${elementCache.links.length} links, ${elementCache.clickables.length} other clickables`);
+  };
+
+  // Initialize observer
+  const domObserver = setupDOMObserver();
+  updateElementCache();
+
+  // Track mouse position and last clicked element for smart scroll
+  let lastMouseX = 0;
+  let lastMouseY = 0;
+  let lastClickedElement = null;
+
+  // Track mouse movements
+  document.addEventListener('mousemove', (e) => {
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+  }, { passive: true });
+
+  // Track clicks to remember context
+  document.addEventListener('click', (e) => {
+    lastClickedElement = e.target;
+    console.log("🖱️ Last clicked element:", lastClickedElement);
+  }, { passive: true });
+
+  // Smart scroll detection - finds scrollable container at mouse position or last click
+  const getSmartScrollTarget = () => {
+    let targetElement = null;
+    
+    // Priority 1: Element at mouse position
+    const elementAtMouse = document.elementFromPoint(lastMouseX, lastMouseY);
+    if (elementAtMouse) {
+      console.log("🎯 Element at mouse:", elementAtMouse);
+      targetElement = elementAtMouse;
+    }
+    
+    // Priority 2: Last clicked element
+    if (!targetElement && lastClickedElement) {
+      console.log("🎯 Using last clicked element:", lastClickedElement);
+      targetElement = lastClickedElement;
+    }
+    
+    // Priority 3: Body/document
+    if (!targetElement) {
+      targetElement = document.body;
+    }
+    
+    // Find the nearest scrollable parent
+    let current = targetElement;
+    while (current && current !== document.documentElement) {
+      const style = window.getComputedStyle(current);
+      const overflowY = style.overflowY;
+      const overflowX = style.overflowX;
+      
+      // Check if this element is scrollable
+      if ((overflowY === 'auto' || overflowY === 'scroll' || 
+           overflowX === 'auto' || overflowX === 'scroll') &&
+          (current.scrollHeight > current.clientHeight || 
+           current.scrollWidth > current.clientWidth)) {
+        
+        console.log("✅ Found scrollable parent:", {
+          element: current,
+          tag: current.tagName,
+          id: current.id,
+          class: current.className,
+          scrollHeight: current.scrollHeight,
+          clientHeight: current.clientHeight
+        });
+        
+        return {
+          element: current,
+          name: current.id || current.className || current.tagName,
+          isWindow: false
+        };
+      }
+      
+      current = current.parentElement;
+    }
+    
+    // Fallback to main window scroll
+    if (document.documentElement.scrollHeight > window.innerHeight) {
+      console.log("✅ Using main window scroll");
+      return {
+        element: document.documentElement,
+        name: 'Main Page',
+        isWindow: true
+      };
+    }
+    
+    console.log("❌ No scrollable area found");
+    return null;
+  };
+
+  // Scroll a specific container
+  const scrollContainer = (container, direction, amount = 0.7) => {
+    if (container.isWindow) {
+      switch(direction) {
+        case 'down':
+          window.scrollBy({ top: window.innerHeight * amount, behavior: 'smooth' });
+          break;
+        case 'up':
+          window.scrollBy({ top: -window.innerHeight * amount, behavior: 'smooth' });
+          break;
+        case 'top':
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+          break;
+        case 'bottom':
+          window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+          break;
+      }
+    } else {
+      const el = container.element;
+      switch(direction) {
+        case 'down':
+          el.scrollBy({ top: el.clientHeight * amount, behavior: 'smooth' });
+          break;
+        case 'up':
+          el.scrollBy({ top: -el.clientHeight * amount, behavior: 'smooth' });
+          break;
+        case 'top':
+          el.scrollTo({ top: 0, behavior: 'smooth' });
+          break;
+        case 'bottom':
+          el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+          break;
+      }
+    }
+  };
+
+  // Removed continuous scrolling functions - keeping only simple scroll
 
   // Clean command - remove filler words and extract intent
   const cleanCommand = (command) => {
@@ -205,77 +562,237 @@
     return cleaned;
   };
 
-  // Smart speak function with recognition management
+  // Fuzzy match function for natural language element selection
+  const fuzzyMatch = (text, query) => {
+    if (!text || !query) return 0;
+    
+    text = text.toLowerCase().trim();
+    query = query.toLowerCase().trim();
+    
+    // Exact match
+    if (text === query) return 1.0;
+    
+    // Contains match
+    if (text.includes(query)) return 0.9;
+    
+    // Word-by-word partial matching
+    const textWords = text.split(/\s+/);
+    const queryWords = query.split(/\s+/);
+    let matchCount = 0;
+    
+    for (const qw of queryWords) {
+      if (textWords.some(tw => tw.includes(qw) || qw.includes(tw))) {
+        matchCount++;
+      }
+    }
+    
+    const wordScore = matchCount / queryWords.length;
+    if (wordScore > 0.5) return 0.7 * wordScore;
+    
+    // Character-level similarity (Levenshtein-like)
+    let matches = 0;
+    for (let i = 0; i < query.length; i++) {
+      if (text.includes(query[i])) matches++;
+    }
+    
+    return (matches / query.length) * 0.5;
+  };
+
+  // Smart element finder with fuzzy matching
+  const findBestElement = (elements, descriptor) => {
+    if (!descriptor || elements.length === 0) return null;
+    
+    let bestMatch = null;
+    let bestScore = 0;
+    
+    for (const el of elements) {
+      const desc = getElementDescription(el);
+      const score = fuzzyMatch(desc, descriptor);
+      
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = el;
+      }
+    }
+    
+    // Only return if confidence is high enough
+    return bestScore >= 0.5 ? bestMatch : null;
+  };
+
+  // Parse command using spaCy NLP backend
+  const parseCommandWithNLP = async (text) => {
+    try {
+      console.log("📡 Sending to NLP backend:", text);
+      
+      const response = await fetch(BACKEND_API, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ text }),
+        signal: AbortSignal.timeout(5000) // 5 second timeout
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const parsed = await response.json();
+      console.log("🧠 NLP parsed:", parsed);
+      
+      return parsed;
+
+    } catch (error) {
+      console.warn("⚠️  NLP backend error:", error.message);
+      console.log("Falling back to pattern matching");
+      return null; // Will fall back to old method
+    }
+  };
+
+  // Smart navigate with intelligent element matching
+  const navigateWithSmartMatch = async (command) => {
+    try {
+      console.log("🎯 Using smart navigate for:", command);
+      
+      // Collect all interactive page elements
+      const pageElements = [];
+      let idCounter = 0;
+      
+      // Get buttons
+      detectElements().buttons.forEach(btn => {
+        pageElements.push({
+          id: idCounter++,
+          text: btn.innerText.trim() || btn.value || btn.ariaLabel || '',
+          type: 'button',
+          selector: `button:nth-of-type(${Array.from(document.querySelectorAll('button')).indexOf(btn) + 1})`
+        });
+      });
+      
+      // Get links
+      detectElements().links.forEach(link => {
+        pageElements.push({
+          id: idCounter++,
+          text: link.innerText.trim() || link.title || link.ariaLabel || '',
+          type: 'link',
+          selector: `a:nth-of-type(${Array.from(document.querySelectorAll('a')).indexOf(link) + 1})`
+        });
+      });
+      
+      // Get inputs
+      detectElements().inputs.forEach(input => {
+        pageElements.push({
+          id: idCounter++,
+          text: input.placeholder || input.name || input.ariaLabel || input.title || '',
+          type: 'input',
+          selector: `input:nth-of-type(${Array.from(document.querySelectorAll('input')).indexOf(input) + 1})`
+        });
+      });
+      
+      console.log(`📦 Collected ${pageElements.length} page elements`);
+      
+      // Call navigate endpoint
+      const response = await fetch(BACKEND_NAVIGATE_API, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ 
+          command,
+          page_elements: pageElements
+        }),
+        signal: AbortSignal.timeout(5000)
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const result = await response.json();
+      console.log("🎯 Smart navigate result:", result);
+      
+      return result;
+
+    } catch (error) {
+      console.warn("⚠️  Smart navigate error:", error.message);
+      return null;
+    }
+  };
+
+  // Smart speak function with recognition management and context memory
   const smartSpeak = (text, callback) => {
+    console.log("🔊 smartSpeak called with:", text);
+    console.log("📊 Voices loaded:", voicesLoaded, "Available voices:", window.speechSynthesis.getVoices().length);
+    
+    if (!text || text.trim() === '') {
+      console.log("⚠️ Empty text, skipping speech");
+      if (callback) callback();
+      return;
+    }
+    
     if (!('speechSynthesis' in window)) {
-      console.log("Speech synthesis not available");
+      console.log("❌ Speech synthesis not available");
       if (callback) callback();
       return;
     }
 
     try {
-      console.log("smartSpeak called with:", text);
+      // Remember what we're saying for "what did you say" commands
+      contextManager.rememberSpoken(text);
       
-      // Cancel any ongoing speech - with small delay to prevent race condition
+      console.log("🛑 Canceling any ongoing speech");
       window.speechSynthesis.cancel();
       
-      // Small delay before starting new speech
-      setTimeout(() => {
-        // Pause recognition while speaking to prevent echo
+      // Create utterance immediately - no delay
+      console.log("📢 Creating utterance for:", text);
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.0;
+      utterance.volume = 1.0;
+      utterance.pitch = 1.0;
+      utterance.lang = 'en-US';
+      
+      // Try to set a voice
+      const voices = window.speechSynthesis.getVoices();
+      if (voices.length > 0) {
+        const englishVoice = voices.find(v => v.lang.includes('en')) || voices[0];
+        utterance.voice = englishVoice;
+        console.log("🎤 Using voice:", englishVoice.name);
+      } else {
+        console.log("⚠️ No voices available yet");
+      }
+      
+      utterance.onstart = () => {
+        console.log("✅ TTS STARTED:", text);
         isSpeaking = true;
-        console.log("Starting TTS, pausing recognition");
-        
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.rate = 0.95;
-        utterance.volume = 1.0;
-        utterance.pitch = 1.0;
-        utterance.lang = 'en-US';
-        
-        utterance.onstart = () => {
-          console.log("TTS started speaking:", text);
-          isSpeaking = true;
-        };
-        
-        utterance.onend = () => {
-          console.log("TTS finished speaking");
-          isSpeaking = false;
-          
-          // Force restart recognition after speaking
-          setTimeout(() => {
-            if (isListening && !isSpeaking) {
-              try {
-                recognition.stop();
-                setTimeout(() => {
-                  if (isListening) {
-                    recognition.start();
-                    console.log("Recognition restarted after TTS");
-                  }
-                }, 100);
-              } catch (e) {
-                console.log("Recognition restart after TTS:", e.message);
-              }
-            }
-            if (callback) callback();
-          }, 200);
-        };
-        
-        utterance.onerror = (event) => {
-          console.error("TTS error:", event.error);
-          isSpeaking = false;
-          if (callback) callback();
-        };
-        
-        console.log("Calling speechSynthesis.speak()");
-        window.speechSynthesis.speak(utterance);
-      }, 50); // Small delay to ensure cancel completes
+      };
+      
+      utterance.onend = () => {
+        console.log("✅ TTS ENDED");
+        isSpeaking = false;
+        if (callback) callback();
+      };
+      
+      utterance.onerror = (event) => {
+        console.error("❌ TTS ERROR:", event.error, event);
+        isSpeaking = false;
+        if (callback) callback();
+      };
+      
+      console.log("🚀 Calling window.speechSynthesis.speak()");
+      window.speechSynthesis.speak(utterance);
+      
+      // Verify it's speaking
+      setTimeout(() => {
+        console.log("📊 Speech status - speaking:", window.speechSynthesis.speaking, "pending:", window.speechSynthesis.pending);
+      }, 100);
+      
     } catch (e) {
-      console.error("Error with speech synthesis:", e);
+      console.error("💥 Error with speech synthesis:", e);
       isSpeaking = false;
       if (callback) callback();
     }
   };
 
-  // Get element description
+  // Get element description with semantic matching
   const getElementDescription = (el) => {
     let desc = el.innerText?.trim().substring(0, 50) || 
                el.getAttribute('aria-label') || 
@@ -284,7 +801,30 @@
                el.name ||
                el.id ||
                'unnamed';
-    return desc.toLowerCase();
+    
+    // Semantic synonyms for better matching
+    const synonymMap = {
+      'login': ['sign in', 'log in', 'signin', 'enter', 'access'],
+      'signup': ['sign up', 'register', 'join', 'create account'],
+      'search': ['find', 'look for', 'query', 'explore'],
+      'submit': ['send', 'go', 'confirm', 'ok', 'done'],
+      'cancel': ['close', 'dismiss', 'exit', 'quit', 'back'],
+      'menu': ['navigation', 'nav', 'options', 'hamburger'],
+      'profile': ['account', 'user', 'settings', 'me'],
+      'cart': ['shopping', 'basket', 'bag', 'checkout'],
+      'home': ['main', 'index', 'start', 'dashboard']
+    };
+    
+    desc = desc.toLowerCase();
+    
+    // Add semantic variations for better matching
+    for (const [key, synonyms] of Object.entries(synonymMap)) {
+      if (desc.includes(key)) {
+        desc += ' ' + synonyms.join(' ');
+      }
+    }
+    
+    return desc;
   };
 
   // Highlight elements with numbers - FIXED positioning
@@ -358,19 +898,78 @@
     });
   };
 
-  // Detect and list elements
+  // Smart element detection - identifies what something is by analyzing it
+  const identifyElementType = (element) => {
+    // Check button
+    if (element.matches('button, [role="button"], input[type="submit"], input[type="button"]')) {
+      return 'button';
+    }
+    // Check link
+    if (element.matches('a[href]')) {
+      return 'link';
+    }
+    // Check input
+    if (element.matches('input, textarea, select')) {
+      return 'input';
+    }
+    // Check clickable
+    if (element.onclick || element.matches('[onclick], [role="link"]')) {
+      return 'clickable';
+    }
+    return 'element';
+  };
+
+  // Smart search - finds element by text regardless of type
+  const smartFindElement = (searchText) => {
+    const allInteractive = [
+      ...elementCache.buttons,
+      ...elementCache.links,
+      ...elementCache.clickables
+    ];
+    
+    const matches = [];
+    const searchLower = searchText.toLowerCase();
+    
+    for (const el of allInteractive) {
+      const text = (el.textContent || el.value || el.placeholder || el.title || el.alt || '').toLowerCase();
+      const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+      
+      if (text.includes(searchLower) || ariaLabel.includes(searchLower)) {
+        const type = identifyElementType(el);
+        matches.push({ element: el, type, text: text.trim().substring(0, 50) });
+      }
+    }
+    
+    return matches;
+  };
+
+  // Detect and list elements with performance optimization
   const detectElements = (type) => {
+    console.log(`🔍 Detecting ${type}...`);
+    const startTime = performance.now();
+    
     let elements = [];
     let message = '';
     
+    // Use cached elements for better performance (refresh if stale)
+    const cacheAge = Date.now() - elementCache.lastUpdate;
+    const CACHE_EXPIRY = 5000; // 5 seconds
+    
+    if (cacheAge > CACHE_EXPIRY) {
+      console.log('🔄 Cache stale, refreshing...');
+      updateElementCache();
+    }
+    
     switch(type) {
       case 'buttons':
-        elements = getVisibleElements('button, [role="button"], input[type="submit"], input[type="button"], .btn, [class*="button"]');
+        elements = elementCache.buttons.length > 0 ? elementCache.buttons : 
+                   getVisibleElements('button, [role="button"], input[type="submit"], input[type="button"], .btn, [class*="button"]');
         message = `Found ${elements.length} buttons`;
         break;
         
       case 'links':
-        elements = getVisibleElements('a[href]');
+        elements = elementCache.links.length > 0 ? elementCache.links :
+                   getVisibleElements('a[href]');
         message = `Found ${elements.length} links`;
         break;
         
@@ -383,7 +982,25 @@
         elements = getVisibleElements('input:not([type="hidden"]), textarea, select');
         message = `Found ${elements.length} input fields`;
         break;
+        
+      case 'clickables':
+      case 'all':
+        // Smart detection - find ALL interactive elements
+        elements = [
+          ...elementCache.buttons,
+          ...elementCache.links,
+          ...elementCache.clickables
+        ];
+        // Remove duplicates using Map for O(n) performance
+        const elementMap = new Map();
+        elements.forEach(el => elementMap.set(el, true));
+        elements = Array.from(elementMap.keys());
+        message = `Found ${elements.length} clickable elements`;
+        break;
     }
+    
+    const elapsed = performance.now() - startTime;
+    console.log(`⚡ Detection completed in ${elapsed.toFixed(2)}ms`);
     
     if (elements.length > 0) {
       highlightElements(elements);
@@ -391,10 +1008,11 @@
       selectionType = type;
       awaitingSelection = true;
       
-      // List first few elements
-      const preview = elements.slice(0, 5).map((el, i) => 
-        `${i + 1}. ${getElementDescription(el)}`
-      ).join(', ');
+      // List first few elements with their types
+      const preview = elements.slice(0, 5).map((el, i) => {
+        const elType = identifyElementType(el);
+        return `${i + 1}. ${elType}: ${getElementDescription(el)}`;
+      }).join(', ');
       
       showStatus(`${message}. Say number to select. ${preview}${elements.length > 5 ? '...' : ''}`, 10000);
       
@@ -439,6 +1057,8 @@
     const index = number - 1;
     if (index >= 0 && index < selectionContext.length) {
       const element = selectionContext[index];
+      
+      // Handle scroll area selection differently
       const description = getElementDescription(element);
       const elementType = selectionType.slice(0, -1); // Remove 's' from 'buttons', 'links', etc.
       
@@ -467,6 +1087,61 @@
     return false;
   };
 
+  // Undo last action
+  const undoLastAction = () => {
+    if (actionHistory.length === 0) {
+      showStatus('❌ No actions to undo', 2000);
+      smartSpeak('Nothing to undo');
+      return false;
+    }
+    
+    const lastAction = actionHistory.pop();
+    console.log('⏪ Undoing action:', lastAction);
+    
+    switch(lastAction.type) {
+      case 'click':
+        // For clicks, we can try to navigate back if it caused navigation
+        const { element, description } = lastAction.data;
+        showStatus(`⏪ Undoing click on: ${description}`, 3000);
+        smartSpeak(`Undoing last click. Going back.`);
+        
+        // Try to go back in history
+        setTimeout(() => {
+          window.history.back();
+        }, 500);
+        return true;
+        
+      case 'scroll':
+        // Undo scroll by scrolling opposite direction
+        const { direction, amount } = lastAction.data;
+        const oppositeDir = direction === 'down' ? 'up' : direction === 'up' ? 'down' : 
+                           direction === 'left' ? 'right' : 'left';
+        showStatus(`⏪ Scrolling ${oppositeDir} to undo`, 2000);
+        smartSpeak(`Scrolling ${oppositeDir}`);
+        
+        if (direction === 'down' || direction === 'up') {
+          window.scrollBy({ top: direction === 'down' ? -amount : amount, behavior: 'smooth' });
+        } else {
+          window.scrollBy({ left: direction === 'right' ? -amount : amount, behavior: 'smooth' });
+        }
+        return true;
+        
+      case 'input':
+        // Restore previous value
+        const { inputElement, oldValue } = lastAction.data;
+        if (inputElement && document.contains(inputElement)) {
+          inputElement.value = oldValue;
+          showStatus('⏪ Restored input value', 2000);
+          smartSpeak('Restored text');
+        }
+        return true;
+        
+      default:
+        showStatus('⏪ Undo not supported for this action', 2000);
+        return false;
+    }
+  };
+
   // Handle confirmation response
   const handleConfirmation = (confirmed) => {
     if (!pendingConfirmation) {
@@ -478,6 +1153,9 @@
       const { element, number, type, description } = pendingConfirmation;
       element.scrollIntoView({ behavior: 'smooth', block: 'center' });
       setTimeout(() => {
+        // Record action for undo
+        recordAction('click', { element, description, number, type });
+        
         element.click();
         showStatus(`✅ Clicked ${type} #${number}: ${description}`, 3000);
         smartSpeak(`Clicked ${description}`);
@@ -503,26 +1181,38 @@
     micButton.disabled = true;
     return;
   }
+  
+  // Store recognition instance globally to prevent duplicates
   const recognition = new SpeechRecognition();
+  window.wsRecognitionInstance = recognition;
+  
   recognition.continuous = true; // Keep listening even after a result
   recognition.interimResults = false; // We only want final results
   recognition.lang = 'en-US';
 
   const showStatus = (text, duration = 3000) => {
+    console.log("📢 Showing status:", text);
     statusPopup.textContent = text;
     statusPopup.style.opacity = '1';
     statusPopup.style.visibility = 'visible';
-    setTimeout(() => {
-      statusPopup.style.opacity = '0';
-      statusPopup.style.visibility = 'hidden';
-    }, duration);
+    statusPopup.style.display = 'block';
+    
+    if (duration > 0) {
+      setTimeout(() => {
+        statusPopup.style.opacity = '0';
+        statusPopup.style.visibility = 'hidden';
+      }, duration);
+    }
   };
 
   recognition.onstart = () => {
-    console.log("Voice recognition started.");
-    isListening = true;
+    console.log("🎤 Voice recognition started. isListening:", isListening);
+    isListening = true; // Ensure flag is set
+    
+    // Update button to red (wrapper stays visible)
     micButton.innerHTML = '🔴';
-    micButton.style.backgroundColor = '#dc3545'; // Red for listening
+    micButton.style.backgroundColor = '#dc3545'; // Red for listening (recording)
+    console.log("🎤 Button updated: 🔴 RED");
     showStatus("🎙️ Listening...", 5000);
     
     // Update storage to sync with popup
@@ -530,7 +1220,27 @@
   };
 
   recognition.onend = () => {
-    console.log("Voice recognition ended. isListening:", isListening, "isSpeaking:", isSpeaking);
+    console.log("🔴 Voice recognition ended. isListening:", isListening, "isSpeaking:", isSpeaking);
+    
+    // If user manually stopped (isListening = false), don't restart
+    if (!isListening) {
+      console.log("🛑 User stopped manually - NOT restarting");
+      chrome.storage.local.set({ isVoiceListening: false });
+      
+      // Cancel any ongoing speech
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {
+        console.log("Speech cancel error:", e.message);
+      }
+      isSpeaking = false;
+      
+      // Update button to gray (wrapper stays visible)
+      micButton.innerHTML = '🎤';
+      micButton.style.backgroundColor = '#6c757d';
+      console.log("✅ Recognition fully stopped, will NOT restart");
+      return; // EXIT - do not restart
+    }
     
     // Don't restart if we're currently speaking
     if (isSpeaking) {
@@ -538,50 +1248,73 @@
       return;
     }
     
-    if (isListening) {
-      // Always restart if we want continuous listening
-      try {
-        setTimeout(() => {
-          if (isListening && !isSpeaking) {
-            try {
-              recognition.start();
-              console.log("Restarted recognition automatically");
-            } catch (startError) {
-              console.log("Recognition already started or error:", startError.message);
-            }
+    // Auto-restart for continuous listening ONLY if isListening is still true
+    console.log("🔁 Auto-restarting recognition (isListening is still true)...");
+    try {
+      setTimeout(() => {
+        // Double-check isListening hasn't changed
+        if (isListening && !isSpeaking) {
+          try {
+            recognition.start();
+            console.log("✅ Restarted recognition automatically");
+          } catch (startError) {
+            console.log("Recognition already started or error:", startError.message);
           }
-        }, 100); // Reduced delay for faster restart
-      } catch (e) {
-        console.error("Error restarting recognition:", e);
-      }
-    } else {
-      micButton.innerHTML = '🎤';
-      micButton.style.backgroundColor = '#007bff'; // Blue for inactive
-      showStatus("🛑 Stopped.", 2000);
-      
-      // Update storage to sync with popup
-      chrome.storage.local.set({ isVoiceListening: false });
+        } else {
+          console.log("⛔ NOT restarting - isListening:", isListening, "isSpeaking:", isSpeaking);
+        }
+      }, 100);
+    } catch (e) {
+      console.error("Error restarting recognition:", e);
     }
   };
 
   recognition.onerror = (event) => {
-    console.error("Speech recognition error:", event.error);
+    console.error("🔴 Speech recognition error:", event.error);
+    
     if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
       showStatus("🎤 Mic access denied. Please allow in browser settings.", 5000);
       isListening = false; // Stop trying to restart
       micButton.innerHTML = '🎤';
       micButton.style.backgroundColor = '#dc3545'; // Red for error
+      
     } else if (event.error === 'no-speech') {
       // No speech detected - this is normal, just continue listening
-      console.log("No speech detected, continuing...");
-      showStatus("👂 Still listening...", 2000);
+      console.log("👂 No speech detected, continuing...");
+      
     } else if (event.error === 'aborted') {
       // Aborted - user stopped it
-      console.log("Recognition aborted");
+      console.log("⛔ Recognition aborted by user");
+      
+    } else if (event.error === 'network') {
+      // Network error - retry after delay
+      console.log("🌐 Network error, will retry in 2 seconds...");
+      showStatus("🌐 Network error, retrying...", 2000);
+      if (isListening) {
+        setTimeout(() => {
+          if (isListening) {
+            try {
+              recognition.start();
+              console.log("🔄 Retried after network error");
+            } catch (e) {
+              console.log("Retry failed:", e.message);
+            }
+          }
+        }, 2000);
+      }
+      
+    } else if (event.error === 'audio-capture') {
+      // Microphone issue
+      console.log("🎤 Audio capture error");
+      showStatus("🎤 Microphone error. Check device.", 3000);
+      isListening = false;
+      micButton.innerHTML = '❌';
+      micButton.style.backgroundColor = '#dc3545';
+      
     } else {
       // Other errors - show but keep trying
-      console.log("Recognition error, will retry:", event.error);
-      showStatus("⚠️ Error, retrying...", 2000);
+      console.log("⚠️ Recognition error, will retry:", event.error);
+      showStatus(`⚠️ Error: ${event.error}`, 2000);
     }
   };
 
@@ -598,8 +1331,622 @@
     }
   };
 
+  // --- Smart Command Execution with NLP ---
+  const executeCommandWithNLP = async (rawCommand, parsed) => {
+    console.log("=== Executing with NLP ===");
+    console.log("Parsed:", parsed);
+    
+    let feedback = "";
+    let commandExecuted = true;
+    
+    // Handle confirmation responses
+    if (parsed.confirmation) {
+      if (pendingConfirmation) {
+        handleConfirmation(parsed.confirmation === 'yes');
+        return;
+      }
+    }
+    
+    // Handle number selection if awaiting
+    if (awaitingSelection && parsed.number) {
+      console.log("Number selection:", parsed.number);
+      if (handleElementInquiry(parsed.number)) {
+        return;
+      }
+    }
+    
+    // Route based on action + target combination
+    const action = parsed.action;
+    const target = parsed.target;
+    const direction = parsed.direction;
+    const descriptor = parsed.descriptor;
+    
+    // GREET command - friendly greeting response
+    if (action === 'greet') {
+      const greetings = [
+        "Hello! How can I help you?",
+        "Hi there! What would you like to do?",
+        "Hey! I'm ready to assist!",
+        "Greetings! What can I do for you?",
+        "Hello! Ready when you are!",
+        "Hi! Let me know what you need!"
+      ];
+      const msg = greetings[Math.floor(Math.random() * greetings.length)];
+      feedback = "👋 " + msg;
+      smartSpeak(msg);
+      showStatus(feedback, 2000);
+      return;
+    }
+    
+    // THANK command - polite response
+    if (action === 'thank') {
+      const responses = [
+        "You're welcome!",
+        "Happy to help!",
+        "My pleasure!",
+        "Anytime!",
+        "Glad I could help!",
+        "No problem at all!",
+        "You're very welcome!",
+        "Always here to help!"
+      ];
+      const msg = responses[Math.floor(Math.random() * responses.length)];
+      feedback = "😊 " + msg;
+      smartSpeak(msg);
+      showStatus(feedback, 2000);
+      return;
+    }
+    
+    // CONFIRM command - acknowledgment (when not in confirmation dialog)
+    if (action === 'confirm' && !pendingConfirmation) {
+      const confirmations = ["Got it!", "Okay!", "Understood!", "Perfect!", "Alright!", "Confirmed!"];
+      const msg = confirmations[Math.floor(Math.random() * confirmations.length)];
+      feedback = "✅ " + msg;
+      smartSpeak(msg);
+      showStatus(feedback, 2000);
+      return;
+    }
+    
+    // DENY command - acknowledgment (when not in confirmation dialog)
+    if (action === 'deny' && !pendingConfirmation) {
+      const denials = ["Okay, got it", "No problem", "Understood", "Alright", "Okay then"];
+      const msg = denials[Math.floor(Math.random() * denials.length)];
+      feedback = "👌 " + msg;
+      smartSpeak(msg);
+      showStatus(feedback, 2000);
+      return;
+    }
+    
+    // HELP command - show available commands
+    if (action === 'help') {
+      const helpMessages = [
+        "I can show buttons, links, and menus. Say 'show buttons' or 'show links', then say a number to click.",
+        "Try saying 'scroll down', 'go back', 'zoom in', 'show links', or 'click button'.",
+        "You can say 'show buttons', 'show links', 'scroll down', 'go back', 'reload page', and much more!",
+        "Just tell me what you want to do! Show elements, click things, scroll, navigate - I'm here to help!"
+      ];
+      feedback = "💡 Available commands";
+      smartSpeak(helpMessages[Math.floor(Math.random() * helpMessages.length)]);
+      showStatus(feedback, 3000);
+      return;
+    }
+    
+    // CANCEL command - hide all highlights and reset state
+    if (action === 'cancel') {
+      clearHighlights();
+      awaitingSelection = false;
+      currentDetectedElements = [];
+      feedback = "❌ Cancelled";
+      smartSpeak("Cancelled");
+      showStatus(feedback, 2000);
+      return;
+    }
+    
+    // UNDO command - rollback last action (multiple variations)
+    if (action === 'undo' || action === 'revert' || action === 'goback') {
+      undoLastAction();
+      return;
+    }
+    
+    // FIND/SEARCH command - smart search for any element by text
+    if (action === 'find' || action === 'search' || action === 'locate') {
+      if (descriptor) {
+        const matches = smartFindElement(descriptor);
+        if (matches.length > 0) {
+          const elements = matches.map(m => m.element);
+          highlightElements(elements);
+          selectionContext = elements;
+          selectionType = 'found';
+          awaitingSelection = true;
+          
+          const preview = matches.slice(0, 5).map((m, i) => 
+            `${i + 1}. ${m.type}: ${m.text.substring(0, 30)}`
+          ).join(', ');
+          
+          feedback = `🔍 Found ${matches.length} matches for "${descriptor}". ${preview}${matches.length > 5 ? '...' : ''}`;
+          smartSpeak(`Found ${matches.length} items matching ${descriptor}. Say the number.`);
+          showStatus(feedback, 10000);
+        } else {
+          feedback = `❌ Nothing found for "${descriptor}"`;
+          smartSpeak(`Could not find ${descriptor}`);
+          showStatus(feedback, 3000);
+        }
+        return;
+      } else {
+        feedback = "🔍 What do you want to find? Say 'find' followed by the text.";
+        smartSpeak("What should I find?");
+        showStatus(feedback, 3000);
+        return;
+      }
+    }
+    
+    // SHOW ALL - smart detection of all clickable elements
+    if (action === 'show' && (target === 'all' || target === 'everything' || target === 'clickable')) {
+      detectElements('all');
+      feedback = "👁️ Showing all clickable elements";
+      return;
+    }
+    
+    // SHOW commands - display elements
+    if (action === 'show' && target === 'button') {
+      const elements = detectElements('buttons');
+      contextManager.remember(action, target, elements);
+      feedback = "🔘 Showing all buttons";
+    } else if (action === 'show' && target === 'link') {
+      const elements = detectElements('links');
+      contextManager.remember(action, target, elements);
+      feedback = "🔗 Showing all links";
+    } else if (action === 'show' && target === 'menu') {
+      const elements = detectElements('menus');
+      contextManager.remember(action, target, elements);
+      feedback = "📋 Showing all menus";
+    } else if (action === 'show' && target === 'input') {
+      const elements = detectElements('inputs');
+      contextManager.remember(action, target, elements);
+      feedback = "📝 Showing all input fields";
+    }
+    
+    // CLICK commands with fuzzy matching
+    else if (action === 'click' && target === 'button') {
+      if (descriptor) {
+        const buttons = getVisibleElements('button, [role="button"], input[type="submit"]');
+        const button = findBestElement(buttons, descriptor);
+        if (button) {
+          contextManager.remember(action, target, [button]);
+          button.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setTimeout(() => button.click(), 500);
+          const desc = getElementDescription(button);
+          feedback = `✅ Clicked button: ${desc.substring(0, 30)}`;
+          smartSpeak(`Clicked ${desc.substring(0, 20)}`);
+        } else {
+          feedback = `❌ Button "${descriptor}" not found`;
+          smartSpeak(`Could not find ${descriptor} button`);
+        }
+      } else if (direction === 'first') {
+        const buttons = getVisibleElements('button, [role="button"]');
+        if (buttons[0]) {
+          buttons[0].click();
+          feedback = `✅ Clicked first button`;
+          smartSpeak(`Clicked first button`);
+        }
+      } else if (direction === 'last') {
+        const buttons = getVisibleElements('button, [role="button"]');
+        if (buttons.length > 0) {
+          buttons[buttons.length - 1].click();
+          feedback = `✅ Clicked last button`;
+          smartSpeak(`Clicked last button`);
+        }
+      } else {
+        detectElements('buttons');
+        feedback = "🔘 Which button? Say the number.";
+      }
+    } else if (action === 'click' && target === 'link') {
+      if (descriptor) {
+        const links = getVisibleElements('a[href]');
+        const link = findBestElement(links, descriptor);
+        if (link) {
+          link.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setTimeout(() => link.click(), 500);
+          const desc = getElementDescription(link);
+          feedback = `🔗 Clicked link: ${desc.substring(0, 30)}`;
+          smartSpeak(`Clicked ${desc.substring(0, 20)}`);
+        } else {
+          feedback = `❌ Link "${descriptor}" not found`;
+          smartSpeak(`Could not find ${descriptor} link`);
+        }
+      } else if (direction === 'first') {
+        const links = getVisibleElements('a[href]');
+        if (links[0]) {
+          links[0].click();
+          feedback = `✅ Clicked first link`;
+          smartSpeak(`Clicked first link`);
+        }
+      } else {
+        detectElements('links');
+        feedback = "🔗 Which link? Say the number.";
+      }
+    }
+    
+    // SCROLL commands with smart detection (mouse position or last click)
+    else if (action === 'scroll') {
+      const target = getSmartScrollTarget();
+      
+      if (!target) {
+        feedback = "❌ No scrollable content found";
+        const variations = ["Nothing to scroll", "No scrollable content", "Can't scroll this page"];
+        smartSpeak(variations[Math.floor(Math.random() * variations.length)]);
+      } else {
+        // Scroll the detected container immediately
+        scrollContainer(target, direction || 'down');
+        
+        const dirText = direction || 'down';
+        feedback = `⬇️ Scrolling ${dirText} on ${target.name}`;
+        const variations = [
+          `Scrolling ${dirText}`,
+          `Moving ${dirText}`,
+          `Going ${dirText}`,
+          `Scrolled ${dirText}`
+        ];
+        smartSpeak(variations[Math.floor(Math.random() * variations.length)]);
+        contextManager.remember('scroll', target.name);
+        console.log(`✅ Smart scrolled ${target.name} ${dirText} (mouse at ${lastMouseX},${lastMouseY})`);
+      }
+    }
+    
+    // NAVIGATION commands
+    else if (action === 'back') {
+      feedback = "⬅️ Going back...";
+      smartSpeak("Going back");
+      setTimeout(() => history.back(), 300);
+    } else if (action === 'forward') {
+      feedback = "➡️ Going forward...";
+      smartSpeak("Going forward");
+      setTimeout(() => history.forward(), 300);
+    } else if (action === 'reload') {
+      feedback = "🔄 Reloading page...";
+      smartSpeak("Reloading page");
+      setTimeout(() => location.reload(), 500);
+    }
+    
+    // TAB commands
+    else if (action === 'open' && target === 'tab') {
+      feedback = "➕ Opening new tab...";
+      chrome.runtime.sendMessage({ type: 'NEW_TAB' }, (response) => {
+        if (response && response.success) {
+          showStatus("✅ New tab opened!", 2000);
+          smartSpeak("New tab opened");
+        }
+      });
+    } else if (action === 'close' && target === 'tab') {
+      feedback = "❌ Closing tab...";
+      chrome.runtime.sendMessage({ type: 'CLOSE_TAB' }, (response) => {
+        if (response && response.success) {
+          showStatus("✅ Tab closed!", 2000);
+        }
+      });
+    } else if (action === 'duplicate' || /duplicate|copy|clone|same/.test(rawCommand.toLowerCase() + ' ' + (target || ''))) {
+      feedback = "📋 Duplicating tab...";
+      console.log("📋 Sending DUPLICATE_TAB message");
+      chrome.runtime.sendMessage({ type: 'DUPLICATE_TAB' }, (response) => {
+        console.log("📋 Duplicate tab response:", response);
+        if (response && response.success) {
+          showStatus("✅ Tab duplicated!", 2000);
+          const variations = [
+            "Tab duplicated",
+            "Created a copy of this tab",
+            "Cloned this tab",
+            "Made a duplicate"
+          ];
+          smartSpeak(variations[Math.floor(Math.random() * variations.length)]);
+        } else {
+          showStatus("❌ Failed to duplicate tab", 2000);
+          smartSpeak("Couldn't duplicate tab");
+        }
+      });
+    }
+    
+    // ZOOM commands
+    else if (action === 'zoom') {
+      if (rawCommand.includes('in') || rawCommand.includes('bigger')) {
+        document.body.style.zoom = (parseFloat(document.body.style.zoom || 1) + 0.1).toString();
+        feedback = "🔍 Zoomed In";
+        smartSpeak("Zoomed in");
+      } else if (rawCommand.includes('out') || rawCommand.includes('smaller')) {
+        document.body.style.zoom = (parseFloat(document.body.style.zoom || 1) - 0.1).toString();
+        feedback = "🔍 Zoomed Out";
+        smartSpeak("Zoomed out");
+      } else if (rawCommand.includes('reset')) {
+        document.body.style.zoom = "1";
+        feedback = "🔍 Zoom Reset";
+        smartSpeak("Zoom reset");
+      }
+    }
+    
+    // HELP command
+    else if (action === 'help') {
+      feedback = "💡 Say: 'show buttons', 'show links', 'scroll down', 'click button', numbers to select, etc.";
+      smartSpeak("I can show buttons, links, and menus. Say a number to click. You can also scroll, zoom, and navigate.");
+    }
+    
+    // STOP command
+    else if (action === 'stop') {
+      feedback = "🛑 Stopping...";
+      isListening = false;
+      recognition.stop();
+      removeHighlights();
+      awaitingSelection = false;
+      selectionContext = [];
+      pendingConfirmation = null;
+      chrome.storage.local.set({ isVoiceControlActive: false });
+    }
+    
+    // NATURAL LANGUAGE NAVIGATION - Smart context-aware commands
+    else if (descriptor && !target) {
+      // Try to find ANY element matching the description
+      console.log("🎯 Smart element search for:", descriptor);
+      
+      const allInteractive = getVisibleElements('button, a, [role="button"], input[type="submit"], [onclick]');
+      const bestMatch = findBestElement(allInteractive, descriptor);
+      
+      if (bestMatch) {
+        bestMatch.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setTimeout(() => {
+          bestMatch.click();
+          const desc = getElementDescription(bestMatch);
+          feedback = `✨ Found and clicked: ${desc.substring(0, 30)}`;
+          smartSpeak(`Clicked ${desc.substring(0, 20)}`);
+        }, 500);
+        commandExecuted = true;
+      } else {
+        feedback = `🔍 Searching for "${descriptor}"...`;
+        smartSpeak(`Looking for ${descriptor}`);
+        
+        // Try semantic search across page text
+        const pageText = document.body.innerText.toLowerCase();
+        if (pageText.includes(descriptor.toLowerCase())) {
+          feedback = `📍 Found "${descriptor}" on page but not clickable`;
+        } else {
+          feedback = `❌ Could not find "${descriptor}"`;
+        }
+      }
+    }
+    
+    // CONTEXTUAL "IT" REFERENCES - Enhanced with multiple variations
+    else if (rawCommand.match(/\b(click it|do that|do it|that one|repeat|again|same thing|once more)\b/i)) {
+      const ctx = contextManager.getContext();
+      
+      // Priority 1: Last clicked element
+      if (ctx.lastClickedElement && document.contains(ctx.lastClickedElement)) {
+        const element = ctx.lastClickedElement;
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setTimeout(() => {
+          recordAction('click', { element, description: getElementDescription(element) });
+          element.click();
+          const desc = getElementDescription(element);
+          feedback = `✅ Clicked again: ${desc}`;
+          smartSpeak(`Clicked ${desc} again`);
+          showStatus(feedback, 3000);
+        }, 300);
+        return;
+      }
+      
+      // Priority 2: Last elements in context
+      if (ctx.hasElements && ctx.lastElements.length > 0) {
+        const element = ctx.lastElements[0];
+        if (document.contains(element)) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setTimeout(() => {
+            recordAction('click', { element, description: getElementDescription(element) });
+            element.click();
+            feedback = `✅ Clicked remembered element`;
+            smartSpeak('Clicked it');
+            showStatus(feedback, 3000);
+          }, 300);
+          return;
+        }
+      }
+      
+      feedback = `❓ What should I click? No previous context.`;
+      smartSpeak('What should I click?');
+      showStatus(feedback, 3000);
+      return;
+    }
+    
+    // Correction handling: "no", "not that"
+    else if (rawCommand.match(/\b(no|nope|not that|wrong|incorrect)\b/i) && !rawCommand.match(/\b(yes|yeah)\b/i)) {
+      if (pendingConfirmation) {
+        handleConfirmation(false);
+        contextManager.addCorrection('rejected_element', pendingConfirmation);
+        return;
+      } else {
+        feedback = `ℹ️ Okay. What should I do?`;
+        smartSpeak('Okay, what should I do?');
+        showStatus(feedback, 3000);
+        clearHighlights();
+        awaitingSelection = false;
+        return;
+      }
+    }
+    
+    // "What did you say" - repeat last speech
+    else if (rawCommand.match(/\b(what did you say|repeat that|say again|what was that)\b/i)) {
+      const ctx = contextManager.getContext();
+      if (ctx.lastSpokenText) {
+        feedback = `💬 "${ctx.lastSpokenText}"`;
+        showStatus(feedback, 5000);
+        smartSpeak(ctx.lastSpokenText);
+      } else {
+        smartSpeak('I haven\'t said anything yet');
+      }
+      return;
+    }
+    
+    // COUNT ELEMENTS
+    else if (action === 'count') {
+      const buttons = getVisibleElements('button, [role="button"]').length;
+      const links = getVisibleElements('a[href]').length;
+      const inputs = getVisibleElements('input, textarea').length;
+      
+      feedback = `📊 Found ${buttons} buttons, ${links} links, ${inputs} inputs`;
+      smartSpeak(`${buttons} buttons, ${links} links, ${inputs} inputs`);
+    }
+    
+    // READ PAGE TITLE OR HEADINGS
+    else if (action === 'read') {
+      if (target === 'heading' || target === 'title') {
+        const heading = document.querySelector('h1, h2');
+        if (heading) {
+          const text = heading.innerText;
+          feedback = `📖 "${text}"`;
+          smartSpeak(text);
+        } else {
+          feedback = `📖 "${document.title}"`;
+          smartSpeak(document.title);
+        }
+      } else if (target === 'page') {
+        feedback = `📖 "${document.title}"`;
+        smartSpeak(document.title);
+      }
+    }
+    
+    // SMART SEARCH - Natural language page search
+    else if (action === 'search' || action === 'find') {
+      if (descriptor) {
+        const searchBox = document.querySelector('input[type="search"], input[name*="search"], input[placeholder*="search" i], input[aria-label*="search" i]');
+        if (searchBox) {
+          searchBox.value = descriptor;
+          searchBox.focus();
+          feedback = `🔍 Typed "${descriptor}" in search box`;
+          smartSpeak(`Searching for ${descriptor}`);
+          
+          // Try to submit
+          const form = searchBox.closest('form');
+          if (form) {
+            setTimeout(() => form.submit(), 500);
+          }
+        } else {
+          // Use browser find
+          window.find(descriptor);
+          feedback = `🔍 Finding "${descriptor}" on page`;
+        }
+      }
+    }
+    
+    // Command not recognized
+    else {
+      commandExecuted = false;
+      feedback = `❓ Not sure what to do. Confidence: ${(parsed.confidence * 100).toFixed(0)}%. Try "help"`;
+    }
+    
+    if (commandExecuted) {
+      console.log("✅ Executed:", feedback);
+      showStatus(feedback);
+    } else {
+      console.log("❌ Not recognized");
+      showStatus(feedback, 3000);
+    }
+  };
+
   // --- Command Execution ---
-  const executeCommand = (rawCommand) => {
+  const executeCommand = async (rawCommand) => {
+    // Try smart navigate first (best matching with context awareness)
+    if (USE_SMART_NAVIGATE && USE_NLP_BACKEND) {
+      try {
+        const result = await navigateWithSmartMatch(rawCommand);
+        
+        if (result && result.success) {
+          console.log("🎯 Using smart navigate");
+          
+          // Show human response
+          if (result.human_response) {
+            smartSpeak(result.human_response);
+            showStatus(`💬 ${result.human_response}`);
+          }
+          
+          // Execute matched action
+          if (result.matched_element) {
+            const elem = document.querySelector(result.matched_element.selector);
+            if (elem) {
+              console.log("✅ Element found:", result.matched_element);
+              
+              // Highlight the element
+              highlightElement(elem);
+              
+              // Perform action based on type
+              if (result.action === 'click') {
+                setTimeout(() => {
+                  elem.click();
+                  console.log("🖱️ Clicked element");
+                }, 500);
+              } else if (result.action === 'fill' && elem.tagName === 'INPUT') {
+                elem.focus();
+                console.log("📝 Focused input");
+              }
+              
+              return;
+            }
+          }
+          
+          // Handle simple navigation actions
+          if (result.action === 'scroll') {
+            const direction = result.direction || 'down';
+            const scrollAmount = direction === 'up' ? -300 : 300;
+            window.scrollBy({ top: scrollAmount, behavior: 'smooth' });
+            return;
+          }
+          
+          if (result.action === 'back') {
+            window.history.back();
+            return;
+          }
+          
+          if (result.action === 'forward') {
+            window.history.forward();
+            return;
+          }
+          
+          if (result.action === 'reload') {
+            window.location.reload();
+            return;
+          }
+          
+          // Show clarification if needed
+          if (result.needs_clarification) {
+            smartSpeak(result.message);
+            showStatus(`❓ ${result.message}`);
+            if (result.options && result.options.length > 0) {
+              console.log("Options:", result.options);
+            }
+            return;
+          }
+        }
+      } catch (error) {
+        console.warn("Smart navigate failed:", error);
+      }
+    }
+    
+    // Fallback to NLP parsing
+    if (USE_NLP_BACKEND) {
+      try {
+        const parsed = await parseCommandWithNLP(rawCommand);
+        
+        if (parsed && parsed.success) {
+          console.log("🧠 Using NLP-based execution");
+          await executeCommandWithNLP(rawCommand, parsed);
+          return;
+        }
+      } catch (error) {
+        console.warn("NLP execution failed, falling back to pattern matching:", error);
+      }
+    }
+    
+    // Final fallback to original pattern matching
+    console.log("Using pattern matching execution");
+    executeCommandLegacy(rawCommand);
+  };
+
+  // Legacy pattern-matching command execution (original implementation)
+  const executeCommandLegacy = (rawCommand) => {
     // Clean the command to extract intent
     const command = cleanCommand(rawCommand);
     
@@ -936,14 +2283,35 @@
     }
     // Stop listening command - conversational (only stop if explicitly saying "stop listening")
     else if (containsAny(command, ['stop listening', 'pause listening', 'deactivate', 'turn off', 'shut up', 'be quiet', 'silence'])) {
-      feedback = "🛑 Stopping...";
+      feedback = "🛑 Stopping voice control...";
+      console.log("🛑 Voice command to stop listening received");
+      
+      // Set flag BEFORE stopping to prevent auto-restart
       isListening = false;
-      recognition.stop();
+      
+      try {
+        recognition.stop();
+      } catch (e) {
+        console.log("Recognition already stopped:", e.message);
+      }
+      
+      // Update UI
+      micButton.innerHTML = '🎤';
+      micButton.style.backgroundColor = '#007bff';
+      
+      // Clean up
       removeHighlights();
       awaitingSelection = false;
       selectionContext = [];
       pendingConfirmation = null;
-      chrome.storage.local.set({ isVoiceControlActive: false });
+      
+      // Update storage
+      chrome.storage.local.set({ 
+        isVoiceControlActive: false,
+        isVoiceListening: false 
+      });
+      
+      smartSpeak("Stopping voice control");
     } else {
       commandExecuted = false;
     }
@@ -959,44 +2327,221 @@
 
   // --- Event Listeners ---
   micButton.addEventListener('click', () => {
+    console.log("🖱️ Mic button clicked. Current state - isListening:", isListening);
+    
     if (isListening) {
+      // User wants to STOP listening (wrapper stays visible)
+      console.log("🛑 User clicked STOP - stopping recognition");
+      
+      // Set flag FIRST to prevent any auto-restart
       isListening = false;
-      recognition.stop();
-      console.log("Manually stopping voice recognition.");
+      isSpeaking = false;
+      
+      // Update UI immediately
+      micButton.innerHTML = '🎤';
+      micButton.style.backgroundColor = '#6c757d';
+      
+      // Cancel any ongoing speech
+      try {
+        window.speechSynthesis.cancel();
+        console.log("🔇 Speech cancelled");
+      } catch (e) {
+        console.log("Speech cancel error:", e.message);
+      }
+      
+      // ABORT recognition immediately (stronger than stop)
+      try {
+        recognition.abort();
+        console.log("⛔ Recognition ABORTED - will not restart");
+      } catch (e) {
+        console.log("Recognition abort:", e.message);
+      }
+      
+      // Also try stop as backup
+      try {
+        recognition.stop();
+      } catch (e) {
+        console.log("Recognition stop:", e.message);
+      }
+      
+      chrome.storage.local.set({ 
+        isVoiceListening: false
+      });
+      
+      showStatus("🛑 Stopped listening", 2000);
+      
     } else {
+      // User wants to START listening (wrapper already visible)
+      console.log("🎤 User clicked START - starting recognition");
+      
+      // Set flag FIRST
+      isListening = true;
+      
       try {
         recognition.start();
+        console.log("✅ Recognition start called");
+        // UI will be updated by onstart event
+        showStatus("🎤 Voice control starting...", 2000);
       } catch (e) {
-        console.error("Could not start recognition:", e);
-        // This can happen if it's already started and errored.
+        console.error("❌ Could not start recognition:", e);
         isListening = false;
+        micButton.innerHTML = '❌';
+        micButton.style.backgroundColor = '#dc3545';
+        showStatus("❌ Failed to start. Check mic permissions.", 3000);
       }
     }
   });
 
   // Automatically start listening when the script is injected
-  try {
-    recognition.start();
-    console.log("Auto-starting voice recognition...");
-  } catch (e) {
-    console.error("Auto-start failed:", e);
-  }
+  chrome.storage.local.get(['isVoiceControlActive', 'isVoiceListening'], (data) => {
+    console.log("📊 Voice control state on load:", data);
+    
+    // Auto-start listening when injected (user activated voice control for this domain)
+    try {
+      console.log("🎤 Auto-starting voice recognition on page load...");
+      
+      // Wait for voices to load before starting
+      const startWithSpeech = () => {
+        console.log("🚀 Starting voice control (wrapper already visible)...");
+        isListening = true; // Set flag first
+        
+        // Show welcome message
+        setTimeout(() => {
+          smartSpeak("Voice control activated. How can I help you?", () => {
+            console.log("✅ Welcome message spoken");
+          });
+        }, 500);
+        
+        try {
+          recognition.start();
+          console.log("✅ Recognition started");
+        } catch (e) {
+          console.error("❌ Recognition start error:", e);
+          // Show error on UI
+          micButton.innerHTML = '❌';
+          micButton.style.backgroundColor = '#dc3545';
+        }
+      };
+      
+      // Check if voices are loaded
+      if (voicesLoaded || window.speechSynthesis.getVoices().length > 0) {
+        console.log("✅ Voices already loaded, starting immediately");
+        startWithSpeech();
+      } else {
+        console.log("⏳ Waiting for voices to load...");
+        // Wait up to 2 seconds for voices
+        const voiceCheckInterval = setInterval(() => {
+          if (window.speechSynthesis.getVoices().length > 0) {
+            console.log("✅ Voices loaded, starting now");
+            voicesLoaded = true;
+            clearInterval(voiceCheckInterval);
+            startWithSpeech();
+          }
+        }, 100);
+        
+        setTimeout(() => {
+          clearInterval(voiceCheckInterval);
+          if (!isListening) {
+            console.log("⚠️ Starting without voices loaded");
+            startWithSpeech();
+          }
+        }, 2000);
+      }
+    } catch (e) {
+      console.error("Auto-start failed:", e);
+      isListening = false;
+      micButton.innerHTML = '🎤';
+      micButton.style.backgroundColor = '#007bff';
+    }
+  });
 
   // Listen for messages from background script to toggle voice control
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'TOGGLE_VOICE_CONTROL') {
+      console.log("📨 Received TOGGLE_VOICE_CONTROL message:", message);
+      
       if (message.active) {
-        // Already active, do nothing
-        console.log("Voice control already active");
+        // Activate - start listening (wrapper already visible)
+        console.log("Activating voice control via message");
+        
+        if (!isListening) {
+          isListening = true;
+          try {
+            recognition.start();
+          } catch (e) {
+            console.error("Failed to start:", e);
+          }
+        }
       } else {
-        // Deactivate - remove UI and stop listening
-        console.log("Deactivating voice control");
-        isListening = false;
-        recognition.stop();
+        // Deactivate - stop listening (wrapper stays visible)
+        console.log("Deactivating voice control via message");
+        isListening = false; // Set flag first to prevent restart
+        isSpeaking = false;
+        
+        // Cancel speech
+        try {
+          window.speechSynthesis.cancel();
+        } catch (e) {
+          console.log("Speech cancel:", e.message);
+        }
+        
+        // Abort recognition
+        try {
+          recognition.abort();
+          console.log("⛔ Recognition aborted via message");
+        } catch (e) {
+          console.log("Recognition abort:", e.message);
+        }
+        
+        // Also stop as backup
+        try {
+          recognition.stop();
+        } catch (e) {
+          console.log("Recognition stop:", e.message);
+        }
+        
         removeHighlights();
-        wrapper.remove();
+        
+        // Update button to gray
+        micButton.innerHTML = '🎤';
+        micButton.style.backgroundColor = '#6c757d';
+        
+        chrome.storage.local.set({ isVoiceListening: false });
+      }
+    }
+    sendResponse({ success: true });
+    return true; // Keep channel open for async
+  });
+
+  // Handle tab visibility changes - pause when tab is hidden, resume when visible
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      console.log("📴 Tab hidden - pausing recognition to save resources");
+      if (isListening) {
+        try {
+          recognition.stop(); // Will auto-restart when tab becomes visible
+        } catch (e) {
+          console.log("Stop on hide:", e.message);
+        }
+      }
+    } else {
+      console.log("👁️ Tab visible - resuming recognition");
+      if (isListening && !isSpeaking) {
+        // Small delay to ensure tab is fully active
+        setTimeout(() => {
+          if (isListening) {
+            try {
+              recognition.start();
+              console.log("✅ Resumed recognition after tab became visible");
+            } catch (e) {
+              console.log("Resume error:", e.message);
+            }
+          }
+        }, 300);
       }
     }
   });
+
+  console.log("✅ Voice control fully initialized and ready");
 
 })();

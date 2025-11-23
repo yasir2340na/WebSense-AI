@@ -22,6 +22,15 @@
       "run_at": "document_idle"
     }
   ],
+  "commands": {
+    "toggle-voice": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+V",
+        "mac": "Command+Shift+V"
+      },
+      "description": "Toggle voice control on/off"
+    }
+  },
   "permissions": [
     "scripting",
     "activeTab",
