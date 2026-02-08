@@ -43,7 +43,7 @@ function App() {
   return (
     <div className="App">
       <header className="App-header">
-        <img src="/icons/icon.svg" className="App-logo" alt="logo" />
+        <img src="/icons/icon128.png" className="App-logo" alt="logo" />
         <h1>WebSense-AI</h1>
         <p>Talk naturally - I understand you! 💬</p>
         

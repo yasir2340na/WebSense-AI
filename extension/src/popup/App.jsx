@@ -42,7 +42,7 @@ function App() {
       </main>
 
       <footer className="app-footer">
-        <small>WebSense-AI v1.0 | NLP Accuracy: ~85%</small>
+        <small>WebSense-AI v1.0 | Voice Navigation</small>
       </footer>
     </div>
   );

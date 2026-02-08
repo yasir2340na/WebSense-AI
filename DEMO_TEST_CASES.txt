@@ -1,0 +1,1253 @@
+================================================================================
+                    WEBSENSE-AI VOICE CONTROL - DEMO TEST CASES
+================================================================================
+
+This document contains comprehensive test cases covering all voice commands
+with different speech variations and expected behaviors.
+
+================================================================================
+                        ACTIVATION & SETUP
+================================================================================
+
+TEST CASE 1: Activate Voice Control
+------------------------------------
+WHAT TO SAY: Press Ctrl+Shift+V (keyboard shortcut)
+WHAT HAPPENS:
+  - Voice control script injected into page
+  - Floating mic button appears (bottom-right corner)
+  - Button shows 🔴 (red) indicating listening state
+  - First time on domain: "Voice control activated. How can I help you?"
+  - Subsequent pages on same domain: Starts silently (no welcome message)
+  - Element cache initialized with all clickable elements
+  - Console shows: "✅ Recognition started"
+
+VARIATIONS: None (keyboard shortcut only)
+
+================================================================================
+                        CONVERSATIONAL COMMANDS
+================================================================================
+
+TEST CASE 2: Greet the System
+------------------------------------
+WHAT TO SAY:
+  - "hello"
+  - "hi"
+  - "hey"
+  - "greetings"
+  - "good morning"
+  - "good afternoon"
+  - "good evening"
+
+WHAT HAPPENS:
+  - Random response (6 variations):
+    * "Hello! How can I help you?"
+    * "Hi there! What would you like to do?"
+    * "Hey! I'm ready to assist!"
+    * "Greetings! What can I do for you?"
+    * "Hello! Ready when you are!"
+    * "Hi! Let me know what you need!"
+  - Status shows: 👋 + response
+  - Continues listening for next command
+
+---
+
+TEST CASE 3: Thank the System
+------------------------------------
+WHAT TO SAY:
+  - "thank you"
+  - "thanks"
+  - "thank"
+  - "appreciate it"
+  - "thanks a lot"
+  - "much appreciated"
+
+WHAT HAPPENS:
+  - Random response (8 variations):
+    * "You're welcome!"
+    * "Happy to help!"
+    * "My pleasure!"
+    * "Anytime!"
+    * "Glad I could help!"
+    * "No problem at all!"
+    * "You're very welcome!"
+    * "Always here to help!"
+  - Status shows: 😊 + response
+  - Continues listening
+
+---
+
+TEST CASE 4: Confirm Action
+------------------------------------
+WHAT TO SAY:
+  - "yes"
+  - "yeah"
+  - "yep"
+  - "sure"
+  - "okay"
+  - "ok"
+  - "alright"
+  - "correct"
+  - "right"
+  - "affirmative"
+
+WHAT HAPPENS:
+  - Random response (6 variations):
+    * "Got it!"
+    * "Okay!"
+    * "Understood!"
+    * "Perfect!"
+    * "Alright!"
+    * "Confirmed!"
+  - Status shows: ✅ + response
+  - If pending confirmation exists, executes the confirmed action
+
+---
+
+TEST CASE 5: Deny/Reject Action
+------------------------------------
+WHAT TO SAY:
+  - "no"
+  - "nope"
+  - "nah"
+  - "negative"
+  - "not really"
+  - "cancel"
+
+WHAT HAPPENS:
+  - Random response (5 variations):
+    * "Okay, got it"
+    * "No problem"
+    * "Understood"
+    * "Alright"
+    * "Okay then"
+  - Status shows: 👌 + response
+  - If pending confirmation exists, cancels the action
+
+---
+
+TEST CASE 6: Ask for Help
+------------------------------------
+WHAT TO SAY:
+  - "help"
+  - "help me"
+  - "what can you do"
+  - "show help"
+  - "assist"
+  - "guide me"
+  - "how do i"
+
+WHAT HAPPENS:
+  - Random help message (4 variations):
+    * "I can show buttons, links, and menus. Say 'show buttons' or 'show links', then say a number to click."
+    * "Try saying 'scroll down', 'go back', 'zoom in', 'show links', or 'click button'."
+    * "You can say 'show buttons', 'show links', 'scroll down', 'go back', 'reload page', and much more!"
+    * "Just tell me what you want to do! Show elements, click things, scroll, navigate - I'm here to help!"
+  - Status shows: 💡 Available commands
+  - Display duration: 3 seconds
+
+================================================================================
+                        ELEMENT DISCOVERY COMMANDS
+================================================================================
+
+TEST CASE 7: Show All Buttons
+------------------------------------
+WHAT TO SAY:
+  - "show buttons"
+  - "display buttons"
+  - "find buttons"
+  - "list buttons"
+  - "show all buttons"
+
+WHAT HAPPENS:
+  - Scans page for all button elements
+  - Highlights each button with yellow outline
+  - Numbers appear above each button (1, 2, 3...)
+  - Status shows: "🔘 Showing all buttons"
+  - Console logs: "Found X buttons"
+  - Buttons include: <button>, [role="button"], input[type="submit"], divs with "button" class
+  - Awaits number selection (e.g., "3" to click button 3)
+
+---
+
+TEST CASE 8: Show All Links
+------------------------------------
+WHAT TO SAY:
+  - "show links"
+  - "display links"
+  - "find links"
+  - "list links"
+  - "show all links"
+
+WHAT HAPPENS:
+  - Scans page for all link elements
+  - Highlights each link with yellow outline
+  - Numbers appear above each link
+  - Status shows: "🔗 Showing all links"
+  - Console logs: "Found X links"
+  - Links include: <a href>, [role="link"]
+  - Awaits number selection
+
+---
+
+TEST CASE 9: Show All Menus
+------------------------------------
+WHAT TO SAY:
+  - "show menus"
+  - "display menus"
+  - "find menus"
+  - "show navigation"
+
+WHAT HAPPENS:
+  - Finds all navigation/menu elements
+  - Highlights: <nav>, [role="navigation"], [role="menu"], .menu, select, dropdowns
+  - Numbers each menu element
+  - Status shows: "📋 Showing all menus"
+  - Awaits selection
+
+---
+
+TEST CASE 10: Show All Input Fields
+------------------------------------
+WHAT TO SAY:
+  - "show inputs"
+  - "show input fields"
+  - "find text boxes"
+  - "show forms"
+
+WHAT HAPPENS:
+  - Finds all input elements
+  - Highlights: input (not hidden), textarea, select
+  - Numbers each field
+  - Status shows: "📝 Showing all input fields"
+  - Awaits selection
+
+---
+
+TEST CASE 11: Show All Clickable Elements
+------------------------------------
+WHAT TO SAY:
+  - "show all"
+  - "show everything"
+  - "show clickable"
+  - "show all clickable elements"
+
+WHAT HAPPENS:
+  - Combines buttons, links, and other clickables
+  - Highlights ALL interactive elements on page
+  - Includes: divs with onclick, [data-action], cursor:pointer elements
+  - Status shows: "👁️ Showing all clickable elements"
+  - Can result in 50+ highlighted elements on complex pages
+
+================================================================================
+                        CLICK COMMANDS
+================================================================================
+
+TEST CASE 12: Click Button by Name
+------------------------------------
+WHAT TO SAY:
+  - "click login"
+  - "click on login button"
+  - "press login"
+  - "click the submit button"
+  - "click sign up"
+
+WHAT HAPPENS:
+  - Searches all buttons for text matching "login" or "submit" or "sign up"
+  - Checks button text, aria-label, title, alt attributes
+  - Uses fuzzy matching (partial matches allowed)
+  - Scrolls element into view (smooth scroll, center of viewport)
+  - Highlights button with red outline and shadow
+  - Waits 500ms (visual feedback)
+  - Clicks the button
+  - Speaks: "Clicked [button text]"
+  - Status shows: ✅ Clicked button: [name]
+  - Highlight removed after 2 seconds
+  - Stores action in context history
+
+VARIATIONS:
+  - "click the login button"
+  - "press the submit button"
+  - "click on sign up"
+  - "hit the login button"
+
+---
+
+TEST CASE 13: Click Link by Name
+------------------------------------
+WHAT TO SAY:
+  - "click about"
+  - "click on about link"
+  - "click the contact link"
+  - "open about page"
+
+WHAT HAPPENS:
+  - Searches all links for matching text
+  - Highlights and scrolls to link
+  - Waits 500ms
+  - Clicks the link (navigates to new page)
+  - Speaks: "Clicked [link text]"
+  - Status shows: 🔗 Clicked link: [name]
+  - Page navigation triggers cleanup
+  - Voice control auto-reinjects on new page
+
+---
+
+TEST CASE 14: Click Numbered Element
+------------------------------------
+WHAT TO SAY (after "show buttons" or "show links"):
+  - "one"
+  - "two"
+  - "three"
+  - "number five"
+  - "5"
+  - "click three"
+  - "select number two"
+
+WHAT HAPPENS:
+  - Validates number is within range
+  - Removes all highlights
+  - Highlights selected element (green outline)
+  - Scrolls to element
+  - Waits 500ms
+  - Clicks the element
+  - Speaks: "Clicked [element type] number [N]"
+  - Clears selection mode
+
+---
+
+TEST CASE 15: Click First/Last Button
+------------------------------------
+WHAT TO SAY:
+  - "click first button"
+  - "click last button"
+  - "press first button"
+  - "click the first link"
+
+WHAT HAPPENS:
+  - Finds first or last button/link on page
+  - Highlights and clicks immediately
+  - Speaks: "Clicked first button" or "Clicked last button"
+  - No numbering shown
+
+================================================================================
+                        SCROLL COMMANDS
+================================================================================
+
+TEST CASE 16: Scroll Down
+------------------------------------
+WHAT TO SAY:
+  - "scroll down"
+  - "go down"
+  - "move down"
+  - "page down"
+  - "down"
+
+WHAT HAPPENS:
+  - Detects scrollable element at mouse cursor position
+  - If no element at cursor, uses last clicked element
+  - If neither, scrolls main window
+  - Scrolls down by 80% of viewport height (~600px)
+  - Smooth animation (behavior: 'smooth')
+  - Speaks random response:
+    * "Scrolling down"
+    * "Moving down"
+    * "Going down"
+    * "Scrolled down"
+  - Status shows: ⬇️ Scrolling down on [container name]
+  - After scroll stops (1 second), checks for lazy-loaded content
+  - Updates element cache if new elements appeared
+  - Console logs: "✅ Smart scrolled [element] down (mouse at X,Y)"
+
+---
+
+TEST CASE 17: Scroll Up
+------------------------------------
+WHAT TO SAY:
+  - "scroll up"
+  - "go up"
+  - "move up"
+  - "page up"
+  - "up"
+
+WHAT HAPPENS:
+  - Same smart detection as scroll down
+  - Scrolls up by 80% of viewport height
+  - Smooth animation
+  - Random speech feedback
+  - Status shows: ⬆️ Scrolling up on [container]
+
+---
+
+TEST CASE 18: Scroll Left/Right
+------------------------------------
+WHAT TO SAY:
+  - "scroll left"
+  - "scroll right"
+  - "move left"
+  - "move right"
+
+WHAT HAPPENS:
+  - Detects horizontally scrollable container
+  - Scrolls left/right by 60% of viewport width (~400px)
+  - Useful for carousels, wide tables, horizontal galleries
+  - Smooth animation
+  - Status shows: ⬅️ Scrolling left or ➡️ Scrolling right
+
+================================================================================
+                        NAVIGATION COMMANDS
+================================================================================
+
+TEST CASE 19: Go Back (Previous Page)
+------------------------------------
+WHAT TO SAY:
+  - "back"
+  - "go back"
+  - "previous"
+  - "previous page"
+  - "back page"
+  - "navigate back"
+  - "return"
+  - "backwards"
+  - "backward"
+
+WHAT HAPPENS:
+  - Random response (5 variations):
+    * "Going back"
+    * "Heading back"
+    * "Back we go"
+    * "Returning to previous page"
+    * "Navigating backwards"
+  - Status shows: ⬅️ [response]...
+  - Speaks response
+  - Waits 300ms
+  - Executes: window.history.back()
+  - Navigates to previous page in browser history
+  - Console logs: "✅ Navigated back in history"
+  - Cleanup runs: stops recognition, cancels speech
+  - On new page load: voice control auto-reinjects
+  - If same domain: starts silently
+  - If different domain: speaks welcome message
+
+---
+
+TEST CASE 20: Go Forward (Next Page)
+------------------------------------
+WHAT TO SAY:
+  - "forward"
+  - "go forward"
+  - "next"
+  - "next page"
+  - "forward page"
+  - "navigate forward"
+  - "advance"
+  - "continue"
+  - "proceed"
+  - "forwards"
+
+WHAT HAPPENS:
+  - Random response (5 variations):
+    * "Going forward"
+    * "Moving forward"
+    * "Forward we go"
+    * "Advancing to next page"
+    * "Navigating forward"
+  - Status shows: ➡️ [response]...
+  - Waits 300ms
+  - Executes: window.history.forward()
+  - Navigates to next page in browser history
+  - Console logs: "✅ Navigated forward in history"
+  - Same cleanup and reinject behavior as "back"
+
+---
+
+TEST CASE 21: Reload/Refresh Page
+------------------------------------
+WHAT TO SAY:
+  - "reload"
+  - "refresh"
+  - "reload page"
+  - "refresh page"
+  - "reload this"
+  - "refresh this"
+  - "update page"
+  - "renew"
+  - "restart"
+
+WHAT HAPPENS:
+  - Random response (4 variations):
+    * "Reloading page"
+    * "Refreshing page"
+    * "Updating page"
+    * "Reloading this page"
+  - Status shows: 🔄 [response]...
+  - Speaks response
+  - Waits 500ms
+  - Executes: window.location.reload()
+  - Page refreshes completely
+  - Console logs: "✅ Page reloaded"
+  - Voice control reinjects on reload
+  - Same domain = silent start
+
+================================================================================
+                        TAB MANAGEMENT COMMANDS
+================================================================================
+
+TEST CASE 22: Open New Tab
+------------------------------------
+WHAT TO SAY:
+  - "open new tab"
+  - "new tab"
+  - "open tab"
+  - "create tab"
+
+WHAT HAPPENS:
+  - Sends message to background script
+  - Background creates new tab
+  - Status shows: ➕ Opening new tab...
+  - Speaks: "New tab opened"
+  - New tab opens with default new tab page
+  - Focus switches to new tab
+  - Voice control NOT active in new tab (user must activate)
+
+---
+
+TEST CASE 23: Close Current Tab
+------------------------------------
+WHAT TO SAY:
+  - "close tab"
+  - "close this tab"
+  - "close window"
+
+WHAT HAPPENS:
+  - Sends message to background script
+  - Background closes current tab
+  - Status shows: ❌ Closing tab...
+  - Tab closes immediately
+  - Focus moves to adjacent tab
+
+---
+
+TEST CASE 24: Duplicate Tab
+------------------------------------
+WHAT TO SAY:
+  - "duplicate"
+  - "duplicate tab"
+  - "copy tab"
+  - "clone tab"
+  - "same tab"
+  - "replicate"
+
+WHAT HAPPENS:
+  - Sends DUPLICATE_TAB message to background
+  - Creates new tab with same URL
+  - Status shows: 📋 Duplicating tab...
+  - Random response (4 variations):
+    * "Tab duplicated"
+    * "Created a copy of this tab"
+    * "Cloned this tab"
+    * "Made a duplicate"
+  - New tab opens next to current tab
+  - Original tab remains active
+
+================================================================================
+                        ZOOM COMMANDS
+================================================================================
+
+TEST CASE 25: Zoom In
+------------------------------------
+WHAT TO SAY:
+  - "zoom in"
+  - "make bigger"
+  - "increase size"
+  - "enlarge"
+
+WHAT HAPPENS:
+  - Increases page zoom by 10%
+  - document.body.style.zoom increases (1.0 → 1.1 → 1.2...)
+  - Status shows: 🔍 Zoomed In
+  - Speaks: "Zoomed in"
+  - All page content gets larger
+  - Can zoom multiple times
+
+---
+
+TEST CASE 26: Zoom Out
+------------------------------------
+WHAT TO SAY:
+  - "zoom out"
+  - "make smaller"
+  - "decrease size"
+  - "shrink"
+
+WHAT HAPPENS:
+  - Decreases page zoom by 10%
+  - document.body.style.zoom decreases (1.0 → 0.9 → 0.8...)
+  - Status shows: 🔍 Zoomed Out
+  - Speaks: "Zoomed out"
+  - All page content gets smaller
+
+---
+
+TEST CASE 27: Reset Zoom
+------------------------------------
+WHAT TO SAY:
+  - "reset zoom"
+  - "zoom reset"
+  - "normal size"
+
+WHAT HAPPENS:
+  - Resets zoom to 100% (1.0)
+  - document.body.style.zoom = "1"
+  - Status shows: 🔍 Zoom Reset
+  - Speaks: "Zoom reset"
+  - Page returns to default size
+
+================================================================================
+                        SEARCH & FIND COMMANDS
+================================================================================
+
+TEST CASE 28: Find Element by Text
+------------------------------------
+WHAT TO SAY:
+  - "find settings"
+  - "search for login"
+  - "locate dashboard"
+  - "where is profile"
+  - "look for contact"
+
+WHAT HAPPENS:
+  - Searches ALL interactive elements (buttons, links, clickables)
+  - Checks textContent, aria-label, title, alt, placeholder
+  - Case-insensitive partial matching
+  - Highlights all matches with yellow outline
+  - Numbers each match
+  - Shows preview (first 5 matches):
+    * "🔍 Found 8 matches for 'settings'. 1. button: Settings, 2. link: Account Settings..."
+  - Speaks: "Found [N] items matching [text]. Say the number."
+  - Awaits number selection
+  - Status shows for 10 seconds
+  - User can say number to click that match
+
+EXAMPLE:
+  Say: "find login"
+  System finds:
+    1. button: "Login"
+    2. link: "Login Help"
+    3. link: "Forgot Login"
+  Say: "two"
+  System clicks "Login Help" link
+
+---
+
+TEST CASE 29: Search with No Results
+------------------------------------
+WHAT TO SAY:
+  - "find nonexistent"
+  - "search for asdfgh"
+
+WHAT HAPPENS:
+  - Searches all elements
+  - No matches found
+  - Status shows: ❌ Nothing found for "nonexistent"
+  - Speaks: "Could not find nonexistent"
+  - No highlights appear
+  - System continues listening
+
+================================================================================
+                        CONTEXT-AWARE COMMANDS
+================================================================================
+
+TEST CASE 30: Click It Again (Repeat Last Action)
+------------------------------------
+WHAT TO SAY (after clicking something):
+  - "click it again"
+  - "do it again"
+  - "do that"
+  - "that one"
+  - "repeat"
+  - "again"
+  - "same thing"
+  - "once more"
+
+WHAT HAPPENS:
+  - Retrieves last clicked element from context
+  - Validates element still exists in DOM
+  - Scrolls to element
+  - Waits 300ms
+  - Clicks element again
+  - Speaks: "Clicked [element] again"
+  - Status shows: ✅ Clicked again: [description]
+  - Useful for pagination, "Next" buttons, repeated actions
+
+---
+
+TEST CASE 31: Undo Last Action
+------------------------------------
+WHAT TO SAY:
+  - "undo"
+  - "undo that"
+  - "go back" (context: undo action, not page navigation)
+  - "revert"
+  - "reverse"
+  - "rollback"
+  - "cancel last"
+  - "take back"
+  - "undo it"
+
+WHAT HAPPENS:
+  - Checks action history (last 20 actions stored)
+  - If undo possible, reverses action
+  - Random response:
+    * "Undoing that for you"
+    * "Going back"
+    * "Reverting"
+    * "Undo complete!"
+  - Limited undo capability (mainly for navigation, scroll)
+
+================================================================================
+                        CANCEL & STOP COMMANDS
+================================================================================
+
+TEST CASE 32: Cancel Current Action
+------------------------------------
+WHAT TO SAY:
+  - "cancel"
+  - "stop"
+  - "never mind"
+
+WHAT HAPPENS:
+  - Removes all highlights from page
+  - Clears awaiting selection mode
+  - Clears current detected elements
+  - Status shows: ❌ Cancelled
+  - Speaks: "Cancelled"
+  - Continues listening for next command
+  - Does NOT stop voice control (use stop button for that)
+
+---
+
+TEST CASE 33: Stop Voice Control
+------------------------------------
+WHAT TO SAY: Click the 🔴 button (or 🎤 button when stopped)
+WHAT HAPPENS:
+  - Stops speech recognition
+  - Cancels any ongoing speech
+  - Button changes to 🎤 (gray)
+  - Stops listening for commands
+  - Wrapper remains visible (always on screen)
+  - Click button again to restart listening
+  - No voice command can stop it (safety feature)
+
+ALTERNATIVE: Say "stop" (limited - may not always work for stopping listener)
+
+================================================================================
+                        ADVANCED CLICK SCENARIOS
+================================================================================
+
+TEST CASE 34: Click Dynamic Content (Dropdown Items)
+------------------------------------
+SCENARIO: Dropdown menu that appears on click
+
+STEP 1: "click account menu"
+  - Finds and clicks button that opens dropdown
+  - Dropdown appears with items: Profile, Settings, Logout
+
+WHAT HAPPENS:
+  - MutationObserver detects new DOM elements (menu items)
+  - Immediate cache update (0ms delay for important changes)
+  - Console logs: "⚡ Important DOM change detected - updating cache immediately"
+  - New menu items added to clickables cache
+  - Console logs: "📦 Cache updated in 12.56ms: 15 buttons, 11 links, 8 other clickables"
+
+STEP 2: "click settings"
+  - Now finds "Settings" in dropdown (wasn't visible before)
+  - Clicks settings link
+  - Navigates to settings page
+
+---
+
+TEST CASE 35: Click on Lazy-Loaded Content
+------------------------------------
+SCENARIO: Infinite scroll page with lazy-loaded buttons
+
+STEP 1: "scroll down"
+  - Page scrolls down
+  - New content loads at bottom
+
+WHAT HAPPENS:
+  - Scroll event triggers debounced check (1000ms delay)
+  - After 1 second, checks cache age
+  - If cache > 2 seconds old, updates
+  - Console logs: "📜 Scroll detected - checking for new content"
+  - forceUpdateCache() runs
+  - New buttons/links from lazy-load added to cache
+  - Console logs: "📦 Cache updated in 45.23ms: 25 buttons, 35 links, 12 other clickables"
+
+STEP 2: "click load more"
+  - Finds newly loaded "Load More" button
+  - Clicks successfully
+
+---
+
+TEST CASE 36: Click Non-Traditional Clickable (Div/Span)
+------------------------------------
+SCENARIO: Modern web app using divs/spans as buttons
+
+ELEMENT: <div class="menu-item clickable" data-action="open-settings">Settings</div>
+
+WHAT TO SAY: "click settings"
+
+WHAT HAPPENS:
+  - Element cache includes divs with:
+    * class containing "click"
+    * [data-action] attribute
+    * cursor:pointer style
+  - Finds div element matching "settings"
+  - Highlights, scrolls, clicks
+  - Works same as traditional button
+  - Status shows: ✅ Clicked: Settings
+
+SUPPORTED NON-TRADITIONAL ELEMENTS:
+  ✅ div[class*="click"], div[class*="button"]
+  ✅ span[class*="click"], span[class*="button"]
+  ✅ [data-action], [data-click], [data-handler]
+  ✅ [role="tab"], [role="option"], [role="menuitem"]
+  ✅ [aria-haspopup], [aria-expanded]
+  ✅ li[class*="item"], [class*="card"], [class*="tile"]
+  ✅ Any element with cursor:pointer style
+
+================================================================================
+                        ERROR HANDLING TEST CASES
+================================================================================
+
+TEST CASE 37: No Microphone Permission
+------------------------------------
+WHAT TO SAY: Activate voice control (Ctrl+Shift+V)
+SCENARIO: Browser blocks microphone access
+
+WHAT HAPPENS:
+  - recognition.onerror fires
+  - Error code: 'not-allowed'
+  - Status shows: ❌ Microphone permission denied
+  - Speaks: "Microphone permission denied"
+  - Button shows ❌ (red X)
+  - Voice control disabled until permission granted
+
+USER ACTION: Go to chrome://settings/content/microphone and allow
+
+---
+
+TEST CASE 38: Microphone Not Available
+------------------------------------
+WHAT TO SAY: Activate voice control
+SCENARIO: No microphone connected
+
+WHAT HAPPENS:
+  - recognition.onerror fires
+  - Error code: 'audio-capture'
+  - Status shows: ❌ Microphone not available
+  - Speaks: "Microphone not available"
+  - Button shows ❌
+  - Voice control cannot start
+
+USER ACTION: Connect microphone and try again
+
+---
+
+TEST CASE 39: No Speech Detected
+------------------------------------
+WHAT TO SAY: (silence, no speech for ~5 seconds)
+SCENARIO: Recognition times out waiting for speech
+
+WHAT HAPPENS:
+  - recognition.onerror fires
+  - Error code: 'no-speech'
+  - Speaks: "I didn't hear anything"
+  - Automatically restarts listening
+  - Button remains 🔴 (red)
+  - No status message (minor error)
+  - Console logs error
+
+---
+
+TEST CASE 40: Network Error (NLP Server Down)
+------------------------------------
+WHAT TO SAY: "click login"
+SCENARIO: spaCy server (port 5001) not running
+
+WHAT HAPPENS:
+  - Speech captured: "click login"
+  - POST to localhost:5001/process fails
+  - Network error caught
+  - Status shows: ❌ Connection to NLP server failed
+  - Speaks: "Connection to NLP server failed"
+  - Voice control continues listening
+  - Conversational commands still work (local processing)
+
+USER ACTION: Start spaCy server: python backend/nlp/spacy_server.py
+
+---
+
+TEST CASE 41: Element Not Found
+------------------------------------
+WHAT TO SAY: "click nonexistent button"
+SCENARIO: No button with that text exists
+
+WHAT HAPPENS:
+  - Searches all buttons, links, clickables
+  - No match found (similarity score too low)
+  - Status shows: ❌ Button "nonexistent button" not found
+  - Speaks: "Could not find nonexistent button"
+  - No highlight appears
+  - No click performed
+  - System continues listening
+
+---
+
+TEST CASE 42: Page Navigation During Action
+------------------------------------
+WHAT TO SAY: "click next page"
+SCENARIO: Link clicked, page starts navigating
+
+WHAT HAPPENS:
+  - Element found and clicked
+  - Page navigation begins
+  - beforeunload event fires
+  - cleanup() function called:
+    * Stops recognition (abort + stop)
+    * Cancels speech synthesis
+    * Resets wsVoiceControlActive flag
+  - Console logs: "📄 Page unloading - cleaning up voice control"
+  - New page loads
+  - webNavigation.onCompleted fires in background.js
+  - Voice control auto-reinjects
+  - If same domain: starts silently
+  - User can immediately start giving commands
+
+================================================================================
+                        PERFORMANCE TEST CASES
+================================================================================
+
+TEST CASE 43: Large Page with 100+ Clickable Elements
+------------------------------------
+SCENARIO: Complex page (e.g., Amazon product page, Gmail inbox)
+
+WHAT TO SAY: "show all"
+
+WHAT HAPPENS:
+  - updateElementCache() runs
+  - Scans entire DOM (can take 50-100ms on large pages)
+  - Console logs: "📦 Cache updated in 87.34ms: 45 buttons, 120 links, 67 other clickables"
+  - Highlights 232 elements (all clickables)
+  - Numbers each element (1-232)
+  - Page may appear very highlighted
+  - Speaks: "Found 232 items. Say the number."
+  - User can say "fifty-seven" to click element 57
+
+PERFORMANCE:
+  - Cache update: 50-100ms
+  - Highlighting: 20-50ms
+  - Total: <150ms on very large pages
+
+---
+
+TEST CASE 44: Rapid Command Succession
+------------------------------------
+WHAT TO SAY: 
+  - "scroll down" (wait for scroll to finish)
+  - "scroll down" (immediately after)
+  - "scroll down" (immediately after)
+
+WHAT HAPPENS:
+  - First scroll: Executes, scrolls 600px
+  - Second scroll: Queued, waits for first to complete
+  - Third scroll: Queued
+  - Each scroll takes ~800ms (animation time)
+  - All three commands execute in sequence
+  - Total time: ~2.4 seconds
+  - No conflicts or missed commands
+
+---
+
+TEST CASE 45: Command During Speech Output
+------------------------------------
+WHAT TO SAY (while system is speaking):
+  - System: "Clicking on login butt..." (still speaking)
+  - User: "scroll down" (interrupts)
+
+WHAT HAPPENS:
+  - isSpeaking flag is true
+  - New command captured by recognition
+  - Speech synthesis cancelled (speechSynthesis.cancel())
+  - New command "scroll down" processed immediately
+  - isSpeaking set to false
+  - Scroll executes
+  - New feedback spoken: "Scrolling down"
+
+BEHAVIOR: Commands can interrupt ongoing speech
+
+================================================================================
+                        EDGE CASES & SPECIAL SCENARIOS
+================================================================================
+
+TEST CASE 46: Multiple Elements with Same Name
+------------------------------------
+SCENARIO: Page has 3 buttons all labeled "Edit"
+
+WHAT TO SAY: "click edit"
+
+WHAT HAPPENS:
+  - Searches buttons, finds 3 matches with identical text
+  - Uses similarity scoring algorithm
+  - Selects FIRST match (topmost in DOM)
+  - Highlights and clicks first "Edit" button
+  - Speaks: "Clicked Edit"
+
+ALTERNATIVE: Use "show buttons" to see all, then say number
+
+---
+
+TEST CASE 47: Hidden Element (Display None)
+------------------------------------
+SCENARIO: Button exists but has style="display:none"
+
+WHAT TO SAY: "click hidden button"
+
+WHAT HAPPENS:
+  - updateElementCache() filters elements
+  - Checks: display !== 'none', visibility !== 'hidden', opacity !== '0'
+  - Hidden button NOT included in cache
+  - Search returns no results
+  - Speaks: "Could not find hidden button"
+
+BEHAVIOR: Only visible elements are clickable
+
+---
+
+TEST CASE 48: Element Inside Iframe
+------------------------------------
+SCENARIO: Button inside <iframe> element
+
+WHAT TO SAY: "click button inside iframe"
+
+WHAT HAPPENS:
+  - Voice control script runs in parent page context
+  - Cannot access iframe content (cross-origin restriction)
+  - Button not found in element cache
+  - Speaks: "Could not find button inside iframe"
+
+LIMITATION: Cannot interact with iframe content
+
+---
+
+TEST CASE 49: Voice Control on Multiple Tabs
+------------------------------------
+SCENARIO: Voice control active on Tab 1 and Tab 2
+
+WHAT HAPPENS:
+  - Each tab has independent voiceControl.js instance
+  - Each has own speech recognition
+  - Only ACTIVE tab's recognition works
+  - Switching tabs:
+    * Tab becomes hidden → recognition pauses
+    * Tab becomes visible → recognition resumes
+  - document.visibilitychange event manages this
+  - Console logs: "⏸️ Paused (tab hidden)" or "▶️ Resumed (tab visible)"
+
+BEHAVIOR: Voice control only listens on active tab
+
+---
+
+TEST CASE 50: Very Long Command
+------------------------------------
+WHAT TO SAY: "hey there can you please click on the login button at the top right of the screen next to the sign up link"
+
+WHAT HAPPENS:
+  - Speech recognition captures full transcript
+  - Sent to spaCy NLP server
+  - Intent analysis: "click" detected
+  - Entity extraction: "login button" extracted
+  - Ignores filler words: "hey there", "please", "at the top right"
+  - Searches for "login button"
+  - Finds and clicks element
+  - Speaks: "Clicking on login button"
+
+BEHAVIOR: Natural language parsing handles verbose commands
+
+================================================================================
+                        TIMING & DELAYS (Technical Reference)
+================================================================================
+
+Speech Recognition:
+  - Silence detection: 500-1000ms after speaking stops
+  - Final transcript ready: 100-200ms after detection
+  - Total speech-to-text: 600-1200ms
+
+NLP Processing:
+  - spaCy parsing: 20-50ms (simple), 50-150ms (complex)
+  - Network round-trip: 10-30ms (localhost)
+  - Total NLP: 40-200ms
+
+Action Execution:
+  - Element search: 5-20ms (cached)
+  - Scroll into view: 100-300ms (smooth animation)
+  - Click delay: 500ms (intentional, for visual feedback)
+  - Total execution: 605-820ms
+
+Text-to-Speech:
+  - Short phrases (3-5 words): 1-2 seconds
+  - Medium phrases (8-12 words): 2-3 seconds
+  - Voice loading: 0-2000ms (first time only)
+
+DOM Updates:
+  - Cache update (small page): 10-30ms
+  - Cache update (large page): 30-100ms
+  - MutationObserver reaction: 0-200ms (debounced)
+  - Scroll detection: 1000ms (debounced)
+
+TOTAL END-TO-END LATENCY:
+  User speaks → Button clicked: ~3-4 seconds
+
+================================================================================
+                        CONSOLE OUTPUT REFERENCE
+================================================================================
+
+Successful Command Flow:
+  🎯 Final transcript: click login
+  📤 Sending to spaCy: click login
+  📥 NLP Response: {action: "click", target: "login", confidence: 0.95}
+  🔍 Finding element: login
+  ✅ Clicked: Login
+  📦 Cache updated in 23.45ms: 15 buttons, 8 links, 5 other clickables
+
+Element Discovery:
+  👁️ MutationObserver activated for dynamic DOM watching
+  ⚡ Important DOM change detected - updating cache immediately
+  📦 Cache updated in 15.67ms: 18 buttons, 12 links, 9 other clickables
+
+Navigation:
+  📄 Page unloading - cleaning up voice control
+  🧹 Cleaning up voice control
+  ✅ Navigated back in history
+
+Errors:
+  ❌ No match found for: nonexistent
+  ⚠️ Recognition error: no-speech
+  ⚠️ Network error connecting to NLP server
+
+================================================================================
+                        BEST PRACTICES FOR TESTING
+================================================================================
+
+1. SPEAK CLEARLY AND NATURALLY
+   ✅ DO: "Click login button" (natural speech)
+   ❌ AVOID: "CLI-CK LOG-IN BUT-TON" (robotic, enunciated)
+
+2. USE EXACT ELEMENT TEXT WHEN POSSIBLE
+   ✅ DO: "Click Sign Up" (matches button text exactly)
+   ❌ AVOID: "Click the signup thingy" (vague, may not match)
+
+3. WAIT FOR FEEDBACK BEFORE NEXT COMMAND
+   ✅ DO: Say command → Wait for response → Next command
+   ❌ AVOID: Rapid-fire multiple commands without waiting
+
+4. USE DISCOVERY BEFORE CLICKING UNKNOWN ELEMENTS
+   ✅ DO: "Show buttons" → See what's available → "3"
+   ❌ AVOID: Guessing element names
+
+5. CHECK CONSOLE FOR DEBUGGING
+   - Open DevTools (F12)
+   - Check Console tab for detailed logs
+   - Look for errors, cache stats, element counts
+
+6. TEST IN QUIET ENVIRONMENT
+   - Background noise affects speech recognition
+   - Use good quality microphone
+   - Speak 6-12 inches from mic
+
+7. VERIFY MICROPHONE PERMISSIONS
+   - Chrome shows mic icon in address bar when listening
+   - Click mic icon → Manage permissions
+   - Ensure "Allow" is selected
+
+================================================================================
+                        TROUBLESHOOTING GUIDE
+================================================================================
+
+PROBLEM: Commands not recognized
+SOLUTION:
+  - Check mic icon in Chrome address bar (should show when listening)
+  - Check console for "🎤 Recognition started successfully"
+  - Verify spaCy server running: python backend/nlp/spacy_server.py
+  - Speak clearly, avoid background noise
+
+PROBLEM: Elements not clicking
+SOLUTION:
+  - Use "show buttons" or "show links" to verify element exists
+  - Check element is visible (not hidden or in iframe)
+  - Try exact element text: "click [exact button text]"
+  - Check console for "❌ No match found"
+
+PROBLEM: Voice control stops working after navigation
+SOLUTION:
+  - Should auto-reinject (check console logs)
+  - If not, press Ctrl+Shift+V to manually reactivate
+  - Check background script running: chrome://extensions
+
+PROBLEM: Welcome message plays on every page
+SOLUTION:
+  - Should only play once per domain
+  - Check Chrome storage: chrome.storage.local (welcomedDomains)
+  - Clear extension storage to reset
+
+PROBLEM: Scroll doesn't work on specific area
+SOLUTION:
+  - Hover mouse over area you want to scroll
+  - Click on area first to set context
+  - Then say "scroll down" (uses smart detection)
+
+================================================================================
+                        QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+BASIC COMMANDS:
+  hello, thanks, yes, no, help
+  show buttons, show links, show all
+  click [name], click first, click last
+  scroll up/down/left/right
+  back, forward, reload
+  find [text], search [text]
+
+NUMBERS (after show command):
+  one, two, three, four, five, etc.
+  1, 2, 3, 4, 5
+
+TAB MANAGEMENT:
+  new tab, close tab, duplicate tab
+
+ZOOM:
+  zoom in, zoom out, reset zoom
+
+CONTEXT:
+  click it again, undo, cancel
+
+STOP:
+  Click 🔴 button to stop listening
+  Click 🎤 button to start listening
+
+================================================================================
+                        END OF TEST CASES DOCUMENT
+================================================================================
+
+Total Test Cases: 50
+Categories Covered: 15
+Commands Tested: 100+
+Variations Documented: 200+
+
+For technical documentation, see: TECHNICAL_FLOW.txt
+For API details, see: docs/API_DOCUMENTATION.md
+For development guide, see: docs/DEVELOPER_GUIDE.md
+For system diagrams, see: docs/VOICE_NAVIGATION_DIAGRAM.md
+
+Last Updated: November 26, 2025
+Version: 1.0

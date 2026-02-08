@@ -29,19 +29,42 @@
       console.log("Speech cleanup error:", e.message);
     }
     
+    // Remove all highlights from page
+    try {
+      document.querySelectorAll('.ws-highlight').forEach(h => {
+        if (h._updatePosition) {
+          window.removeEventListener('scroll', h._updatePosition, true);
+          window.removeEventListener('resize', h._updatePosition);
+        }
+        h.remove();
+      });
+      console.log("✅ Removed all highlights");
+    } catch (e) {
+      console.log("Highlight cleanup error:", e.message);
+    }
+    
     window.wsVoiceControlActive = false;
   };
 
-  // Handle page navigation/unload - cleanup before page changes
-  window.addEventListener('beforeunload', () => {
-    console.log("📄 Page unloading - cleaning up voice control");
-    cleanup();
-  });
-  
-  // Also handle pagehide for better browser compatibility
+  // Handle page hide/visibility changes - cleanup when page is hidden
+  // Note: beforeunload is deprecated and violates Chrome's permissions policy
   window.addEventListener('pagehide', () => {
     console.log("📄 Page hiding - cleaning up voice control");
     cleanup();
+  });
+  
+  // Also handle visibility change for better cleanup
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      console.log("👁️ Page hidden - pausing voice control");
+      if (window.wsRecognitionInstance) {
+        try {
+          window.wsRecognitionInstance.stop();
+        } catch (e) {
+          console.log("Recognition pause error:", e.message);
+        }
+      }
+    }
   });
 
   // Remove old UI if exists (for re-injection on navigation)
@@ -356,34 +379,76 @@
     lastUpdate: 0
   };
 
+  // Debounced update timer
+  let updateCacheTimer = null;
+
   // MutationObserver to watch for dynamic DOM changes
   const setupDOMObserver = () => {
     const observer = new MutationObserver((mutations) => {
       let shouldUpdate = false;
+      let hasImportantChange = false;
       
       for (const mutation of mutations) {
         // Check if nodes were added or removed
         if (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0) {
+          // Check if added nodes contain interactive elements
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType === 1) { // Element node
+              const elem = node;
+              // Check for any potentially clickable element
+              if (elem.matches('button, a, [role="button"], [onclick], nav, menu, [role="menu"], [role="dialog"], [role="tab"], [role="menuitem"], div[class*="click"], span[class*="click"], [data-action], [aria-haspopup]')) {
+                hasImportantChange = true;
+                shouldUpdate = true;
+                break;
+              }
+              // Check if it contains interactive elements
+              if (elem.querySelectorAll && elem.querySelectorAll('button, a, [role="button"], [onclick], div[class*="click"], span[class*="click"]').length > 0) {
+                hasImportantChange = true;
+                shouldUpdate = true;
+                break;
+              }
+            }
+          }
+          if (hasImportantChange) break;
           shouldUpdate = true;
-          break;
         }
+        
         // Check if attributes changed on interactive elements
         if (mutation.type === 'attributes' && mutation.target) {
           const target = mutation.target;
-          if (target.matches('button, a, [role="button"], [onclick]')) {
+          if (target.matches('button, a, [role="button"], [onclick], [role="menu"], [role="dialog"], div[class*="click"], span[class*="click"], [data-action]')) {
             shouldUpdate = true;
+            // Style/class changes might affect visibility - important
+            if (mutation.attributeName === 'style' || mutation.attributeName === 'class') {
+              hasImportantChange = true;
+            }
             break;
           }
         }
       }
       
       if (shouldUpdate) {
-        // Debounce cache updates to avoid excessive recomputation
-        const now = Date.now();
-        if (now - elementCache.lastUpdate > 500) {
-          console.log('🔄 DOM changed, updating element cache...');
+        // Clear any pending update
+        if (updateCacheTimer) {
+          clearTimeout(updateCacheTimer);
+        }
+        
+        // If important change (new menu, dialog, etc.), update immediately
+        if (hasImportantChange) {
+          console.log('⚡ Important DOM change detected - updating cache immediately');
           updateElementCache();
-          elementCache.lastUpdate = now;
+          elementCache.lastUpdate = Date.now();
+        } else {
+          // Otherwise debounce for 200ms for better performance
+          updateCacheTimer = setTimeout(() => {
+            const now = Date.now();
+            if (now - elementCache.lastUpdate > 200) {
+              console.log('🔄 DOM changed, updating element cache...');
+              updateElementCache();
+              elementCache.lastUpdate = now;
+            }
+            updateCacheTimer = null;
+          }, 200); // Faster debounce - was 500ms
         }
       }
     });
@@ -392,24 +457,128 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['style', 'class', 'hidden', 'disabled']
+      attributeFilter: ['style', 'class', 'hidden', 'disabled', 'aria-hidden']
     });
     
     console.log('👁️ MutationObserver activated for dynamic DOM watching');
     return observer;
   };
 
-  // Update element cache
+  // Update element cache with performance optimization
   const updateElementCache = () => {
-    elementCache.buttons = getVisibleElements('button, [role="button"], input[type="submit"], input[type="button"], .btn, [class*="button"]');
-    elementCache.links = getVisibleElements('a[href]');
-    elementCache.clickables = getVisibleElements('[onclick], [role="link"], [tabindex]:not([tabindex="-1"])');
-    console.log(`📦 Cache updated: ${elementCache.buttons.length} buttons, ${elementCache.links.length} links, ${elementCache.clickables.length} other clickables`);
+    const startTime = performance.now();
+    
+    // Traditional buttons and button-like elements
+    elementCache.buttons = getVisibleElements('button, [role="button"], input[type="submit"], input[type="button"], .btn, [class*="button"], [class*="Button"]');
+    
+    // Links
+    elementCache.links = getVisibleElements('a[href], [role="link"]');
+    
+    // ALL other clickable elements (modern web apps use divs, spans, etc.)
+    elementCache.clickables = getVisibleElements([
+      '[onclick]',
+      '[role="menuitem"]',
+      '[role="tab"]',
+      '[role="option"]',
+      '[role="checkbox"]',
+      '[role="radio"]',
+      '[role="switch"]',
+      '[role="treeitem"]',
+      '[role="gridcell"]',
+      '[tabindex]:not([tabindex="-1"])',
+      'div[class*="click"]',
+      'div[class*="Click"]',
+      'span[class*="click"]',
+      'span[class*="Click"]',
+      'div[class*="btn"]',
+      'div[class*="Btn"]',
+      'span[class*="btn"]',
+      'span[class*="Btn"]',
+      '[data-action]',
+      '[data-click]',
+      '[data-handler]',
+      '[data-testid*="button"]',
+      '[data-testid*="click"]',
+      '[aria-haspopup]',
+      '[aria-expanded]',
+      '[class*="interactive"]',
+      '[class*="Interactive"]',
+      '[class*="selectable"]',
+      '[class*="Selectable"]',
+      'li[class*="item"]',
+      'li[class*="Item"]',
+      '[class*="card"]',
+      '[class*="Card"]',
+      '[class*="tile"]',
+      '[class*="Tile"]'
+    ].join(', '));
+    
+    // Also detect elements with cursor:pointer style (common for clickables)
+    const allElements = document.querySelectorAll('div, span, p, li, label');
+    const pointerElements = Array.from(allElements).filter(el => {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.cursor === 'pointer' && 
+             rect.width > 0 && 
+             rect.height > 0 && 
+             style.display !== 'none' && 
+             style.visibility !== 'hidden' &&
+             style.opacity !== '0' &&
+             // Has some text content or child elements
+             (el.textContent.trim().length > 0 || el.children.length > 0);
+    });
+    
+    // Merge pointer elements with clickables (avoid duplicates)
+    const existingClickables = new Set(elementCache.clickables);
+    pointerElements.forEach(el => {
+      if (!existingClickables.has(el)) {
+        elementCache.clickables.push(el);
+      }
+    });
+    
+    const duration = performance.now() - startTime;
+    console.log(`📦 Cache updated in ${duration.toFixed(2)}ms: ${elementCache.buttons.length} buttons, ${elementCache.links.length} links, ${elementCache.clickables.length} other clickables`);
+  };
+
+  // Force cache update (can be called manually)
+  const forceUpdateCache = () => {
+    console.log('🔄 Forcing cache update...');
+    updateElementCache();
+    elementCache.lastUpdate = Date.now();
   };
 
   // Initialize observer
   const domObserver = setupDOMObserver();
+  
+  // Initial cache update
   updateElementCache();
+  
+  // Update cache when page fully loads (for lazy-loaded content)
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+      console.log('📄 DOMContentLoaded - updating cache');
+      setTimeout(forceUpdateCache, 500); // Wait for lazy content
+    });
+  }
+  
+  // Also update on window load (for images and heavy content)
+  window.addEventListener('load', () => {
+    console.log('🌐 Window loaded - updating cache');
+    setTimeout(forceUpdateCache, 1000); // Wait for everything
+  });
+  
+  // Update cache on scroll (for infinite scroll / lazy loading)
+  let scrollUpdateTimer = null;
+  window.addEventListener('scroll', () => {
+    if (scrollUpdateTimer) clearTimeout(scrollUpdateTimer);
+    scrollUpdateTimer = setTimeout(() => {
+      const now = Date.now();
+      if (now - elementCache.lastUpdate > 2000) { // Only if not updated recently
+        console.log('📜 Scroll detected - checking for new content');
+        forceUpdateCache();
+      }
+    }, 1000); // Debounce scroll events
+  }, { passive: true });
 
   // Track mouse position and last clicked element for smart scroll
   let lastMouseX = 0;
@@ -422,10 +591,22 @@
     lastMouseY = e.clientY;
   }, { passive: true });
 
-  // Track clicks to remember context
+  // Track clicks to remember context and trigger cache update on expandable elements
   document.addEventListener('click', (e) => {
     lastClickedElement = e.target;
     console.log("🖱️ Last clicked element:", lastClickedElement);
+    
+    // Check if clicked element might trigger new content (dropdown, accordion, etc.)
+    const target = e.target.closest('[role="button"], [aria-expanded], [aria-controls], .dropdown, .accordion, details, summary');
+    if (target) {
+      console.log('🎯 Clicked expandable element - scheduling cache update');
+      // Wait a bit for animation/content to load, then update cache
+      setTimeout(() => {
+        console.log('⚡ Updating cache after expandable element click');
+        updateElementCache();
+        elementCache.lastUpdate = Date.now();
+      }, 300); // Wait for animations
+    }
   }, { passive: true });
 
   // Smart scroll detection - finds scrollable container at mouse position or last click
@@ -654,39 +835,62 @@
     try {
       console.log("🎯 Using smart navigate for:", command);
       
+      // Ensure cache is updated
+      const cacheAge = Date.now() - elementCache.lastUpdate;
+      if (cacheAge > 5000) {
+        console.log('🔄 Refreshing element cache before smart navigate...');
+        updateElementCache();
+      }
+      
       // Collect all interactive page elements
       const pageElements = [];
       let idCounter = 0;
       
-      // Get buttons
-      detectElements().buttons.forEach(btn => {
-        pageElements.push({
-          id: idCounter++,
-          text: btn.innerText.trim() || btn.value || btn.ariaLabel || '',
-          type: 'button',
-          selector: `button:nth-of-type(${Array.from(document.querySelectorAll('button')).indexOf(btn) + 1})`
+      // Get buttons from cache
+      if (elementCache.buttons && elementCache.buttons.length > 0) {
+        elementCache.buttons.forEach(btn => {
+          const text = btn.innerText?.trim() || btn.value || btn.ariaLabel || '';
+          if (text) {  // Only include if has text
+            pageElements.push({
+              id: idCounter++,
+              text: text,
+              type: 'button',
+              selector: `button:nth-of-type(${Array.from(document.querySelectorAll('button')).indexOf(btn) + 1})`
+            });
+          }
         });
-      });
+      }
       
-      // Get links
-      detectElements().links.forEach(link => {
-        pageElements.push({
-          id: idCounter++,
-          text: link.innerText.trim() || link.title || link.ariaLabel || '',
-          type: 'link',
-          selector: `a:nth-of-type(${Array.from(document.querySelectorAll('a')).indexOf(link) + 1})`
+      // Get links from cache
+      if (elementCache.links && elementCache.links.length > 0) {
+        elementCache.links.forEach(link => {
+          const text = link.innerText?.trim() || link.title || link.ariaLabel || '';
+          if (text) {  // Only include if has text
+            pageElements.push({
+              id: idCounter++,
+              text: text,
+              type: 'link',
+              selector: `a:nth-of-type(${Array.from(document.querySelectorAll('a')).indexOf(link) + 1})`
+            });
+          }
         });
-      });
+      }
       
       // Get inputs
-      detectElements().inputs.forEach(input => {
-        pageElements.push({
-          id: idCounter++,
-          text: input.placeholder || input.name || input.ariaLabel || input.title || '',
-          type: 'input',
-          selector: `input:nth-of-type(${Array.from(document.querySelectorAll('input')).indexOf(input) + 1})`
+      const inputs = getVisibleElements('input:not([type="hidden"]), textarea, select');
+      if (inputs && inputs.length > 0) {
+        inputs.forEach(input => {
+          const text = input.placeholder || input.name || input.ariaLabel || input.title || '';
+          if (text) {  // Only include if has identifying text
+            pageElements.push({
+              id: idCounter++,
+              text: text,
+              type: 'input',
+              selector: `input:nth-of-type(${Array.from(document.querySelectorAll('input')).indexOf(input) + 1})`
+            });
+          }
         });
-      });
+      }
       
       console.log(`📦 Collected ${pageElements.length} page elements`);
       
@@ -719,8 +923,8 @@
   };
 
   // Smart speak function with recognition management and context memory
-  const smartSpeak = (text, callback) => {
-    console.log("🔊 smartSpeak called with:", text);
+  const smartSpeak = (text, callback = null, userGesture = false) => {
+    console.log("🔊 smartSpeak called with:", text, "[userGesture:", userGesture, "]");
     console.log("📊 Voices loaded:", voicesLoaded, "Available voices:", window.speechSynthesis.getVoices().length);
     
     if (!text || text.trim() === '') {
@@ -772,12 +976,27 @@
       };
       
       utterance.onerror = (event) => {
-        console.error("❌ TTS ERROR:", event.error, event);
+        // Handle different error types appropriately
+        if (event.error === 'interrupted') {
+          // Interrupted is normal - happens when new speech starts or page navigates
+          console.log("⏸️ TTS interrupted (normal - new speech starting or navigation)");
+        } else if (event.error === 'canceled') {
+          // Canceled is normal - user or code stopped speech
+          console.log("🚫 TTS canceled (normal)");
+        } else if (event.error === 'not-allowed' && !userGesture) {
+          // Not-allowed without user gesture is expected
+          console.log("⚠️ TTS blocked (requires user gesture) - this is normal on page load");
+          showStatus("🔇 Voice ready. Click mic to hear welcome.", 3000);
+        } else {
+          // Only log unexpected errors
+          console.warn("⚠️ TTS ERROR:", event.error, event);
+        }
+        
         isSpeaking = false;
         if (callback) callback();
       };
       
-      console.log("🚀 Calling window.speechSynthesis.speak()");
+      console.log("🚀 Calling window.speechSynthesis.speak() [userGesture:", userGesture, "]");
       window.speechSynthesis.speak(utterance);
       
       // Verify it's speaking
@@ -1270,7 +1489,12 @@
   };
 
   recognition.onerror = (event) => {
-    console.error("🔴 Speech recognition error:", event.error);
+    // Log abort and network errors as info, not errors (they're normal)
+    if (event.error === 'aborted' || event.error === 'no-speech' || event.error === 'network') {
+      console.log("🔵 Speech recognition:", event.error, "(normal behavior)");
+    } else {
+      console.warn("⚠️ Speech recognition error:", event.error);
+    }
     
     if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
       showStatus("🎤 Mic access denied. Please allow in browser settings.", 5000);
@@ -1280,11 +1504,25 @@
       
     } else if (event.error === 'no-speech') {
       // No speech detected - this is normal, just continue listening
-      console.log("👂 No speech detected, continuing...");
+      // (already logged above as info)
       
     } else if (event.error === 'aborted') {
-      // Aborted - user stopped it
-      console.log("⛔ Recognition aborted by user");
+      // Aborted - usually during page navigation or manual stop
+      // (already logged above as info)
+      // Don't try to restart if page is unloading
+      if (!document.hidden && isListening) {
+        console.log("🔄 Will restart recognition after abort...");
+        setTimeout(() => {
+          if (isListening && !isSpeaking && !document.hidden) {
+            try {
+              recognition.start();
+              console.log("✅ Restarted after abort");
+            } catch (e) {
+              console.log("Could not restart:", e.message);
+            }
+          }
+        }, 500);
+      }
       
     } else if (event.error === 'network') {
       // Network error - retry after delay
@@ -1433,7 +1671,7 @@
     
     // CANCEL command - hide all highlights and reset state
     if (action === 'cancel') {
-      clearHighlights();
+      removeHighlights();
       awaitingSelection = false;
       currentDetectedElements = [];
       feedback = "❌ Cancelled";
@@ -1443,7 +1681,7 @@
     }
     
     // UNDO command - rollback last action (multiple variations)
-    if (action === 'undo' || action === 'revert' || action === 'goback') {
+    if (action === 'undo' || action === 'revert') {
       undoLastAction();
       return;
     }
@@ -1593,19 +1831,54 @@
       }
     }
     
-    // NAVIGATION commands
-    else if (action === 'back') {
-      feedback = "⬅️ Going back...";
-      smartSpeak("Going back");
-      setTimeout(() => history.back(), 300);
-    } else if (action === 'forward') {
-      feedback = "➡️ Going forward...";
-      smartSpeak("Going forward");
-      setTimeout(() => history.forward(), 300);
-    } else if (action === 'reload') {
-      feedback = "🔄 Reloading page...";
-      smartSpeak("Reloading page");
-      setTimeout(() => location.reload(), 500);
+    // NAVIGATION commands - Enhanced with multiple keyword variations
+    else if (action === 'back' || action === 'previous' || rawCommand.match(/\b(go back|previous page|back page|navigate back|return)\b/i)) {
+      const responses = [
+        "Going back",
+        "Heading back",
+        "Back we go",
+        "Returning to previous page",
+        "Navigating backwards"
+      ];
+      const msg = responses[Math.floor(Math.random() * responses.length)];
+      feedback = "⬅️ " + msg + "...";
+      smartSpeak(msg);
+      showStatus(feedback, 2000);
+      setTimeout(() => {
+        window.history.back();
+        console.log("✅ Navigated back in history");
+      }, 300);
+    } else if (action === 'forward' || action === 'next' || rawCommand.match(/\b(go forward|next page|forward page|navigate forward|advance)\b/i)) {
+      const responses = [
+        "Going forward",
+        "Moving forward",
+        "Forward we go",
+        "Advancing to next page",
+        "Navigating forward"
+      ];
+      const msg = responses[Math.floor(Math.random() * responses.length)];
+      feedback = "➡️ " + msg + "...";
+      smartSpeak(msg);
+      showStatus(feedback, 2000);
+      setTimeout(() => {
+        window.history.forward();
+        console.log("✅ Navigated forward in history");
+      }, 300);
+    } else if (action === 'reload' || action === 'refresh' || rawCommand.match(/\b(reload page|refresh page|reload this|refresh this|update page)\b/i)) {
+      const responses = [
+        "Reloading page",
+        "Refreshing page",
+        "Updating page",
+        "Reloading this page"
+      ];
+      const msg = responses[Math.floor(Math.random() * responses.length)];
+      feedback = "🔄 " + msg + "...";
+      smartSpeak(msg);
+      showStatus(feedback, 2000);
+      setTimeout(() => {
+        window.location.reload();
+        console.log("✅ Page reloaded");
+      }, 500);
     }
     
     // TAB commands
@@ -1762,7 +2035,7 @@
         feedback = `ℹ️ Okay. What should I do?`;
         smartSpeak('Okay, what should I do?');
         showStatus(feedback, 3000);
-        clearHighlights();
+        removeHighlights();
         awaitingSelection = false;
         return;
       }
@@ -1854,7 +2127,8 @@
       try {
         const result = await navigateWithSmartMatch(rawCommand);
         
-        if (result && result.success) {
+        // Check if result exists and has expected properties
+        if (result && typeof result === 'object' && result.success) {
           console.log("🎯 Using smart navigate");
           
           // Show human response
@@ -2377,6 +2651,25 @@
       // Set flag FIRST
       isListening = true;
       
+      // Speak welcome on first mic click (user gesture allows TTS)
+      const currentDomain = window.location.hostname;
+      chrome.storage.local.get(['micClickedDomains'], (result) => {
+        const clickedDomains = result.micClickedDomains || [];
+        
+        if (!clickedDomains.includes(currentDomain)) {
+          // First time clicking mic on this domain - speak welcome
+          setTimeout(() => {
+            smartSpeak("Voice control activated. How can I help you?", null, true);
+          }, 500);
+          
+          // Mark this domain
+          clickedDomains.push(currentDomain);
+          const recentDomains = clickedDomains.slice(-50);
+          chrome.storage.local.set({ micClickedDomains: recentDomains });
+          console.log("🎉 Welcome speech will play (first mic click on domain)");
+        }
+      });
+      
       try {
         recognition.start();
         console.log("✅ Recognition start called");
@@ -2400,17 +2693,36 @@
     try {
       console.log("🎤 Auto-starting voice recognition on page load...");
       
+      // Track if this is first activation (for welcome message)
+      let hasSpokenWelcome = false;
+      
       // Wait for voices to load before starting
       const startWithSpeech = () => {
         console.log("🚀 Starting voice control (wrapper already visible)...");
         isListening = true; // Set flag first
         
-        // Show welcome message
-        setTimeout(() => {
-          smartSpeak("Voice control activated. How can I help you?", () => {
-            console.log("✅ Welcome message spoken");
-          });
-        }, 500);
+        // Show welcome message only on first user interaction
+        const currentDomain = window.location.hostname;
+        chrome.storage.local.get(['welcomedDomains'], (result) => {
+          const welcomedDomains = result.welcomedDomains || [];
+          const alreadyWelcomed = welcomedDomains.includes(currentDomain);
+          
+          if (!alreadyWelcomed && !hasSpokenWelcome) {
+            // Show welcome in status immediately (visual feedback)
+            showStatus("🎤 Voice ready! Click mic to start & hear welcome.", 4000);
+            hasSpokenWelcome = true;
+            
+            // Mark this domain as welcomed
+            welcomedDomains.push(currentDomain);
+            // Keep only last 50 domains to avoid storage bloat
+            const recentDomains = welcomedDomains.slice(-50);
+            chrome.storage.local.set({ welcomedDomains: recentDomains }, () => {
+              console.log("📝 Domain marked as welcomed:", currentDomain);
+            });
+          } else {
+            console.log("🔇 Skipping welcome message - already welcomed on this domain");
+          }
+        });
         
         try {
           recognition.start();

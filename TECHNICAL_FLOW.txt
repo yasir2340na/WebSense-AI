@@ -1,0 +1,1087 @@
+================================================================================
+                    WEBSENSE-AI TECHNICAL FLOW DOCUMENTATION
+================================================================================
+
+PROJECT OVERVIEW
+================================================================================
+WebSense-AI is a Chrome Extension with voice-controlled web automation powered by
+NLP (Natural Language Processing) using spaCy. The system consists of three main
+components:
+
+1. Chrome Extension (Frontend) - Manifest V3
+2. Node.js Backend API Server (Port 3000)
+3. Python spaCy NLP Server (Port 5001)
+
+ARCHITECTURE COMPONENTS
+================================================================================
+
+1. CHROME EXTENSION (Extension/)
+   ├── Background Script (background/background.js)
+   │   - Service worker running in background
+   │   - Listens for keyboard shortcuts (Ctrl+Shift+V)
+   │   - Injects voice control into active tabs
+   │   - Manages tab lifecycle and navigation events
+   │
+   ├── Content Script (dist/voiceControl.js - 2641 lines)
+   │   - Injected into web pages
+   │   - Handles speech recognition (Web Speech API)
+   │   - Manages UI (floating mic button)
+   │   - Processes voice commands
+   │   - Interacts with DOM elements
+   │
+   └── Popup UI (popup/App.jsx)
+       - Extension popup interface
+       - Quick access controls
+       - Status display
+
+2. NODE.JS BACKEND (backend/)
+   ├── Server (server.js - Port 3000)
+   │   - Express.js REST API
+   │   - CORS middleware for extension access
+   │   - Rate limiting and security
+   │
+   ├── Routes
+   │   - /api/health - Health check endpoint
+   │   - /api/summarize - Text summarization (OpenAI)
+   │   - /api/translate - Language translation (Google)
+   │   - /api/vision - Image analysis (Google Vision)
+   │
+   └── Services
+       - openai.js - GPT integration
+       - googleTranslate.js - Translation API
+       - googleVision.js - Image recognition
+       - safeBrowsing.js - Security checking
+
+3. PYTHON NLP SERVER (backend/nlp/)
+   └── spacy_server.py (Port 5001)
+       - Flask REST API
+       - spaCy NLP processing
+       - Command intent classification
+       - Entity extraction
+       - Action execution logic
+
+COMPLETE TECHNICAL FLOW
+================================================================================
+
+INITIALIZATION FLOW:
+--------------------
+
+Step 1: Extension Installation
+   - Chrome loads manifest.json
+   - Background script registers
+   - Sets up keyboard listener (Ctrl+Shift+V)
+
+Step 2: User Activates Voice Control (Ctrl+Shift+V)
+   
+   background.js Line 105-145:
+   ┌─────────────────────────────────────────────────────────────┐
+   │ function injectVoiceControl(tabId)                          │
+   │   ├── Check cooldown (2-second protection)                  │
+   │   ├── Execute script: dist/voiceControl.js                  │
+   │   └── Mark tab as injected                                  │
+   └─────────────────────────────────────────────────────────────┘
+
+Step 3: Voice Control Injection into Page
+
+   voiceControl.js Line 1-48:
+   ┌─────────────────────────────────────────────────────────────┐
+   │ IIFE (Immediately Invoked Function Expression)              │
+   │   ├── Check if already active (wsVoiceControlActive)        │
+   │   ├── Create cleanup handlers (beforeunload, pagehide)      │
+   │   ├── Remove old UI if exists                               │
+   │   └── Initialize system                                     │
+   └─────────────────────────────────────────────────────────────┘
+
+Step 4: UI Creation
+
+   voiceControl.js Line 128-250:
+   ┌─────────────────────────────────────────────────────────────┐
+   │ Create Floating UI Wrapper                                  │
+   │   ├── Position: fixed, bottom-right (20px)                  │
+   │   ├── Z-index: 2147483647 (always on top)                   │
+   │   ├── Display: flex (always visible)                        │
+   │   ├── Mic Button: 🎤 (gray when stopped, 🔴 red when active)│
+   │   └── Inject into document.body                             │
+   └─────────────────────────────────────────────────────────────┘
+
+Step 5: Element Cache Initialization
+
+   voiceControl.js Line 252-349:
+   ┌─────────────────────────────────────────────────────────────┐
+   │ updateElementCache()                                         │
+   │   ├── Query all buttons: querySelector('button, [role...]') │
+   │   ├── Query all links: querySelectorAll('a[href]')          │
+   │   ├── Query clickables: input[type="submit"], select, etc.  │
+   │   ├── Filter visible elements only                          │
+   │   ├── Store in elementCache object                          │
+   │   └── Log cache stats with performance timing               │
+   └─────────────────────────────────────────────────────────────┘
+
+Step 6: MutationObserver Setup
+
+   voiceControl.js Line 350-452:
+   ┌─────────────────────────────────────────────────────────────┐
+   │ setupDOMObserver()                                           │
+   │   ├── Watch for: childList, subtree, attributes             │
+   │   ├── Detect important changes (menus, dialogs, nav)        │
+   │   ├── Immediate update for important changes (0ms)          │
+   │   ├── Debounced update for normal changes (200ms)           │
+   │   └── Return observer instance                              │
+   └─────────────────────────────────────────────────────────────┘
+
+Step 7: Speech Recognition Setup
+
+   voiceControl.js Line 1166-1187:
+   ┌─────────────────────────────────────────────────────────────┐
+   │ const recognition = new webkitSpeechRecognition()           │
+   │   ├── continuous: true (keeps listening)                    │
+   │   ├── interimResults: true (real-time feedback)             │
+   │   ├── lang: 'en-US'                                         │
+   │   └── maxAlternatives: 1                                    │
+   └─────────────────────────────────────────────────────────────┘
+
+Step 8: Auto-Start Listening
+
+   voiceControl.js Line 2495-2540:
+   ┌─────────────────────────────────────────────────────────────┐
+   │ Auto-start on injection                                      │
+   │   ├── Wait for voices to load (speechSynthesis)             │
+   │   ├── Check if domain already welcomed                      │
+   │   ├── If new domain: speak "Voice control activated..."     │
+   │   ├── If known domain: silently start                       │
+   │   ├── Set isListening = true                                │
+   │   ├── Change button: 🔴 (red background)                    │
+   │   └── Call recognition.start()                              │
+   └─────────────────────────────────────────────────────────────┘
+
+VOICE COMMAND PROCESSING FLOW
+================================================================================
+
+USER SPEAKS → SPEECH RECOGNITION → NLP ANALYSIS → ACTION EXECUTION → RESPONSE
+
+Detailed Step-by-Step:
+
+1. USER SPEAKS COMMAND
+   Example: "Click on login button"
+
+2. SPEECH RECOGNITION CAPTURES AUDIO
+
+   voiceControl.js Line 1246-1270 (recognition.onresult):
+   ┌─────────────────────────────────────────────────────────────┐
+   │ Event: recognition.onresult                                  │
+   │   ├── Extract transcript from event.results                 │
+   │   ├── Check if final result                                 │
+   │   ├── Log transcript to console                             │
+   │   └── Call processCommand(transcript)                       │
+   └─────────────────────────────────────────────────────────────┘
+   
+   Output: transcript = "click on login button"
+
+3. COMMAND PREPROCESSING
+
+   voiceControl.js Line 560-620 (processCommand):
+   ┌─────────────────────────────────────────────────────────────┐
+   │ processCommand(transcript)                                   │
+   │   ├── Normalize: toLowerCase(), trim()                      │
+   │   ├── Check for conversational keywords                     │
+   │   │   - "hello", "hi", "hey" → greet action                 │
+   │   │   - "thank", "thanks" → thank action                    │
+   │   │   - "yes", "okay", "sure" → confirm action              │
+   │   │   - "no", "nope", "cancel" → deny action                │
+   │   │   - "help", "what can you do" → help action             │
+   │   ├── If not conversational → send to NLP server            │
+   │   └── Handle response                                       │
+   └─────────────────────────────────────────────────────────────┘
+
+4. SEND TO SPACY NLP SERVER
+
+   voiceControl.js Line 770-850 (sendToSpacyServer):
+   ┌─────────────────────────────────────────────────────────────┐
+   │ API Call to http://localhost:5001/process                   │
+   │                                                              │
+   │ Request:                                                     │
+   │   POST /process                                              │
+   │   Content-Type: application/json                            │
+   │   Body: {                                                    │
+   │     "text": "click on login button",                        │
+   │     "page_title": document.title,                           │
+   │     "url": window.location.href                             │
+   │   }                                                          │
+   └─────────────────────────────────────────────────────────────┘
+
+5. SPACY NLP PROCESSING
+
+   spacy_server.py Line 200-450 (process_text endpoint):
+   ┌─────────────────────────────────────────────────────────────┐
+   │ Flask Route: @app.route('/process', methods=['POST'])       │
+   │                                                              │
+   │ Step 1: Parse JSON request                                  │
+   │   text = "click on login button"                            │
+   │   page_title = "Example Website"                            │
+   │   url = "https://example.com"                               │
+   │                                                              │
+   │ Step 2: Process with spaCy                                  │
+   │   doc = nlp(text.lower())                                   │
+   │   tokens = [token.text for token in doc]                    │
+   │   pos_tags = [token.pos_ for token in doc]                  │
+   │                                                              │
+   │ Step 3: Extract intent (action)                             │
+   │   analyze_intent(text, doc)                                 │
+   │     ├── Check keywords: "click" in text                     │
+   │     ├── Action detected: "click"                            │
+   │     └── Confidence: 0.95                                    │
+   │                                                              │
+   │ Step 4: Extract entities (target)                           │
+   │   extract_entities(doc, intent)                             │
+   │     ├── Look for nouns after "click on"                     │
+   │     ├── Found: "login button"                               │
+   │     └── Target: "login button"                              │
+   │                                                              │
+   │ Step 5: Generate response                                   │
+   │   generate_response(intent, entities)                       │
+   │     ├── Select random response template                     │
+   │     └── Response: "Clicking on login button"                │
+   └─────────────────────────────────────────────────────────────┘
+
+   Response JSON:
+   {
+     "action": "click",
+     "target": "login button",
+     "confidence": 0.95,
+     "response": "Clicking on login button",
+     "entities": ["login", "button"],
+     "tokens": ["click", "on", "login", "button"],
+     "pos_tags": ["VERB", "ADP", "NOUN", "NOUN"]
+   }
+
+6. ACTION EXECUTION IN BROWSER
+
+   voiceControl.js Line 900-1100 (executeAction):
+   ┌─────────────────────────────────────────────────────────────┐
+   │ executeAction(actionData)                                    │
+   │                                                              │
+   │ Step 1: Speak response                                      │
+   │   smartSpeak("Clicking on login button")                    │
+   │                                                              │
+   │ Step 2: Find matching element                               │
+   │   findMatchingElement(target, elementCache.buttons)         │
+   │     ├── Search in button text: "Login", "Sign In"           │
+   │     ├── Check aria-label attributes                         │
+   │     ├── Check button IDs                                    │
+   │     └── Match found: <button id="login-btn">Login</button>  │
+   │                                                              │
+   │ Step 3: Highlight element                                   │
+   │   element.style.outline = '3px solid #ff6b6b'               │
+   │   element.style.boxShadow = '0 0 10px rgba(255,107,107,0.5)'│
+   │                                                              │
+   │ Step 4: Click element                                       │
+   │   element.scrollIntoView({ behavior: 'smooth' })            │
+   │   setTimeout(() => {                                        │
+   │     element.click()                                         │
+   │   }, 500)                                                   │
+   │                                                              │
+   │ Step 5: Store in context                                    │
+   │   contextManager.remember('click', 'login button', [elem])  │
+   │                                                              │
+   │ Step 6: Remove highlight                                    │
+   │   setTimeout(() => removeHighlights(), 2000)                │
+   └─────────────────────────────────────────────────────────────┘
+
+7. CONTINUE LISTENING
+
+   voiceControl.js Line 1188-1220 (recognition.onend):
+   ┌─────────────────────────────────────────────────────────────┐
+   │ Event: recognition.onend                                     │
+   │   ├── Check if should restart (isListening === true)        │
+   │   ├── Wait 300ms (prevent rapid restarts)                   │
+   │   └── Call recognition.start() again                        │
+   └─────────────────────────────────────────────────────────────┘
+
+API ENDPOINTS REFERENCE
+================================================================================
+
+1. SPACY NLP SERVER (http://localhost:5001)
+
+   POST /process
+   ├── Purpose: Process natural language commands
+   ├── Input: {"text": "command", "page_title": "...", "url": "..."}
+   ├── Output: {"action": "...", "target": "...", "confidence": 0.95, ...}
+   └── Processing time: ~50-200ms
+
+   GET /health
+   ├── Purpose: Check server status
+   └── Output: {"status": "ok", "model": "en_core_web_sm"}
+
+2. NODE.JS BACKEND (http://localhost:3000)
+
+   GET /api/health
+   ├── Purpose: Health check
+   └── Output: {"status": "ok", "timestamp": "..."}
+
+   POST /api/summarize
+   ├── Purpose: Summarize text using OpenAI GPT
+   ├── Input: {"text": "long text...", "maxLength": 100}
+   └── Output: {"summary": "shortened text..."}
+
+   POST /api/translate
+   ├── Purpose: Translate text using Google Translate
+   ├── Input: {"text": "Hello", "targetLang": "es"}
+   └── Output: {"translation": "Hola", "sourceLang": "en"}
+
+   POST /api/vision
+   ├── Purpose: Analyze images using Google Vision
+   ├── Input: {"imageUrl": "https://..."}
+   └── Output: {"labels": [...], "text": "...", "safe": true}
+
+KEY FUNCTIONS REFERENCE
+================================================================================
+
+CHROME EXTENSION FUNCTIONS:
+
+1. injectVoiceControl(tabId)
+   Location: background.js:105-145
+   Purpose: Inject voice control script into active tab
+   Parameters: tabId (Chrome tab ID)
+   Returns: Promise
+   Dependencies: chrome.scripting.executeScript
+
+2. updateElementCache()
+   Location: voiceControl.js:252-349
+   Purpose: Scan page and cache all interactive elements
+   Updates: elementCache.buttons, elementCache.links, elementCache.clickables
+   Performance: ~10-50ms depending on page complexity
+
+3. setupDOMObserver()
+   Location: voiceControl.js:350-452
+   Purpose: Watch for DOM changes (new elements, menus, dropdowns)
+   Returns: MutationObserver instance
+   Triggers: updateElementCache() on changes
+   Debounce: 200ms (normal), 0ms (important changes)
+
+4. processCommand(transcript)
+   Location: voiceControl.js:560-620
+   Purpose: Main command processing pipeline
+   Flow: Normalize → Check conversational → Send to NLP → Execute
+   Parameters: transcript (string from speech recognition)
+
+5. sendToSpacyServer(text)
+   Location: voiceControl.js:770-850
+   Purpose: Send command to NLP server for analysis
+   Method: POST fetch to localhost:5001/process
+   Timeout: 5000ms
+   Error handling: Network errors, server errors
+
+6. executeAction(actionData)
+   Location: voiceControl.js:900-1100
+   Purpose: Execute parsed action on page
+   Actions: click, type, scroll, navigate, read, search
+   Flow: Speak → Find element → Highlight → Execute → Store context
+
+7. findMatchingElement(target, elements)
+   Location: voiceControl.js:1120-1165
+   Purpose: Find best matching element from cache
+   Matching: Text content, aria-label, ID, class, title
+   Algorithm: Fuzzy matching with similarity scoring
+   Returns: DOM element or null
+
+8. smartSpeak(text, callback)
+   Location: voiceControl.js:2200-2280
+   Purpose: Text-to-speech with voice selection
+   Uses: SpeechSynthesisUtterance
+   Voice: Prefers female English voices
+   Rate: 1.1x (slightly faster)
+   Pitch: 1.0 (normal)
+
+9. cleanup()
+   Location: voiceControl.js:13-48
+   Purpose: Clean up on page unload/navigation
+   Actions: Stop recognition, cancel speech, reset flags
+   Triggers: beforeunload, pagehide events
+
+SPACY SERVER FUNCTIONS:
+
+1. analyze_intent(text, doc)
+   Location: spacy_server.py:450-650
+   Purpose: Classify command intent/action
+   Algorithm: Keyword matching + dependency parsing
+   Actions: click, type, scroll, navigate, read, search, greet, thank, etc.
+   Returns: (action, confidence)
+
+2. extract_entities(doc, intent)
+   Location: spacy_server.py:652-750
+   Purpose: Extract target entities (buttons, links, text)
+   Methods: NER, noun chunks, dependency relations
+   Returns: List of entity strings
+
+3. generate_response(intent, entities)
+   Location: spacy_server.py:752-850
+   Purpose: Generate natural language response
+   Responses: 6-15 variations per action type
+   Selection: Random choice for variety
+   Returns: Response string
+
+4. handle_conversational(intent, entities)
+   Location: spacy_server.py:300-400
+   Purpose: Handle greetings, thanks, confirmations
+   Keywords: 30+ per category
+   Responses: 6-8 variations
+   Returns: Response JSON
+
+STORAGE AND STATE MANAGEMENT
+================================================================================
+
+1. CHROME STORAGE (chrome.storage.local)
+   
+   welcomedDomains: Array<string>
+   ├── Purpose: Track domains that received welcome message
+   ├── Max size: 50 most recent domains
+   └── Format: ["youtube.com", "github.com", "example.com"]
+
+2. ELEMENT CACHE (in-memory)
+   
+   elementCache = {
+     buttons: Array<HTMLElement>,
+     links: Array<HTMLElement>,
+     clickables: Array<HTMLElement>,
+     lastUpdate: timestamp
+   }
+   ├── Updated by: MutationObserver, scroll, DOMContentLoaded
+   ├── Refresh rate: On-demand (smart debouncing)
+   └── Typical size: 50-500 elements depending on page
+
+3. CONTEXT MANAGER (in-memory)
+   
+   contextManager = {
+     lastAction: string,
+     lastTarget: string,
+     lastElements: Array<HTMLElement>,
+     lastClickedElement: HTMLElement,
+     lastSpokenText: string,
+     conversationHistory: Array<Object>,
+     corrections: Array<Object>
+   }
+   ├── Purpose: Remember previous actions for context
+   ├── History size: Last 30 interactions
+   └── Use cases: "click it again", "go back", "what did you say"
+
+4. RECOGNITION STATE FLAGS
+   
+   isListening: boolean
+   ├── Purpose: Track if recognition is active
+   └── Critical: Must set BEFORE calling abort/stop
+
+   isSpeaking: boolean
+   ├── Purpose: Track if TTS is active
+   └── Prevents command processing during speech
+
+   voicesLoaded: boolean
+   ├── Purpose: Track if speech voices are ready
+   └── Required before TTS can work
+
+================================================================================
+                            DRY RUN EXAMPLES
+================================================================================
+
+EXAMPLE 1: CLICKING A BUTTON
+================================================================================
+
+Scenario: User wants to click "Sign Up" button on example.com/register
+
+STEP-BY-STEP EXECUTION:
+
+[T=0ms] User presses Ctrl+Shift+V
+  └─ background.js detects keyboard event
+
+[T=10ms] background.js:injectVoiceControl(tabId)
+  ├─ Check injection cooldown: OK
+  ├─ Execute dist/voiceControl.js in tab
+  └─ Mark tab as injected
+
+[T=50ms] voiceControl.js IIFE starts
+  ├─ Check wsVoiceControlActive: false
+  ├─ Set wsVoiceControlActive = true
+  ├─ Register cleanup handlers
+  └─ Remove old UI (none exists)
+
+[T=100ms] Create UI wrapper
+  ├─ Create div#ws-voice-wrapper
+  ├─ Style: fixed, bottom:20px, right:20px, z-index:2147483647
+  ├─ Create button with 🎤 icon
+  ├─ Append to document.body
+  └─ Wrapper visible (display: flex)
+
+[T=150ms] Initialize element cache
+  ├─ Call updateElementCache()
+  ├─ Query buttons: 15 found (including "Sign Up")
+  ├─ Query links: 8 found
+  ├─ Query clickables: 5 found
+  ├─ Store in elementCache
+  └─ Log: "📦 Cache updated in 23.45ms: 15 buttons, 8 links, 5 other clickables"
+
+[T=200ms] Setup MutationObserver
+  ├─ Create observer watching: childList, subtree, attributes
+  ├─ Observe document.body
+  └─ Log: "👁️ MutationObserver activated"
+
+[T=250ms] Setup speech recognition
+  ├─ Create webkitSpeechRecognition instance
+  ├─ Set continuous: true, interimResults: true
+  ├─ Register event handlers: onstart, onresult, onerror, onend
+  └─ Store as window.wsRecognitionInstance
+
+[T=300ms] Auto-start voice control
+  ├─ Check domain: example.com
+  ├─ Query chrome.storage.local for welcomedDomains
+  ├─ Result: ["youtube.com", "github.com"] (example.com not in list)
+  └─ New domain detected
+
+[T=350ms] Welcome message
+  ├─ Call smartSpeak("Voice control activated. How can I help you?")
+  ├─ Create SpeechSynthesisUtterance
+  ├─ Select voice: "Google US English Female"
+  ├─ Set rate: 1.1, pitch: 1.0
+  ├─ Call speechSynthesis.speak(utterance)
+  └─ Audio plays: "Voice control activated. How can I help you?"
+
+[T=400ms] Start recognition
+  ├─ Set isListening = true
+  ├─ Change button: innerHTML = '🔴', backgroundColor = '#dc3545'
+  ├─ Call recognition.start()
+  └─ Log: "✅ Recognition started"
+
+[T=450ms] recognition.onstart fires
+  └─ Log: "🎤 Recognition started successfully"
+
+[T=500ms] Add domain to welcomed list
+  ├─ Update welcomedDomains: ["youtube.com", "github.com", "example.com"]
+  ├─ chrome.storage.local.set({welcomedDomains: [...]})
+  └─ Log: "📝 Domain marked as welcomed: example.com"
+
+[T=2000ms] Welcome message finishes playing
+  └─ System ready for commands
+
+[T=5000ms] USER SPEAKS: "Click on sign up button"
+
+[T=5100ms] recognition.onresult fires
+  ├─ Extract transcript: "click on sign up button"
+  ├─ Check isFinal: true
+  ├─ Log: "🎯 Final transcript: click on sign up button"
+  └─ Call processCommand("click on sign up button")
+
+[T=5110ms] processCommand() executes
+  ├─ Normalize: text = "click on sign up button"
+  ├─ Check conversational keywords: false (not a greeting/thank)
+  └─ Call sendToSpacyServer("click on sign up button")
+
+[T=5120ms] sendToSpacyServer() sends HTTP request
+  ├─ Method: POST
+  ├─ URL: http://localhost:5001/process
+  ├─ Headers: Content-Type: application/json
+  ├─ Body: {
+  │   "text": "click on sign up button",
+  │   "page_title": "Register - Example Site",
+  │   "url": "https://example.com/register"
+  │ }
+  └─ Await response...
+
+[T=5150ms] spacy_server.py receives request
+  ├─ Route: @app.route('/process', methods=['POST'])
+  ├─ Parse JSON: text = "click on sign up button"
+  └─ Call process_text(text, page_title, url)
+
+[T=5155ms] NLP processing begins
+  ├─ Create spaCy doc: doc = nlp("click on sign up button")
+  ├─ Tokenize: ["click", "on", "sign", "up", "button"]
+  ├─ POS tags: ["VERB", "ADP", "VERB", "ADP", "NOUN"]
+  └─ Dependencies parsed
+
+[T=5160ms] analyze_intent() executes
+  ├─ Search for keywords: "click" found in text
+  ├─ Check verb: token.lemma_ == "click" → True
+  ├─ Intent detected: "click"
+  ├─ Confidence: 0.95
+  └─ Return ("click", 0.95)
+
+[T=5165ms] extract_entities() executes
+  ├─ Intent: "click"
+  ├─ Look for target after "click on"
+  ├─ Find noun phrase: "sign up button"
+  ├─ Extract entities: ["sign", "up", "button"]
+  └─ Return ["sign up button"]
+
+[T=5170ms] generate_response() executes
+  ├─ Intent: "click"
+  ├─ Target: "sign up button"
+  ├─ Response templates: [
+  │   "Clicking on {target}",
+  │   "Let me click {target} for you",
+  │   "Opening {target}",
+  │   ...
+  │ ]
+  ├─ Random selection: "Clicking on sign up button"
+  └─ Return response
+
+[T=5175ms] spacy_server.py sends response
+  └─ JSON: {
+      "action": "click",
+      "target": "sign up button",
+      "confidence": 0.95,
+      "response": "Clicking on sign up button",
+      "entities": ["sign", "up", "button"],
+      "tokens": ["click", "on", "sign", "up", "button"],
+      "pos_tags": ["VERB", "ADP", "VERB", "ADP", "NOUN"]
+    }
+
+[T=5185ms] voiceControl.js receives response
+  ├─ Response status: 200 OK
+  ├─ Parse JSON: actionData = {...}
+  └─ Call executeAction(actionData)
+
+[T=5190ms] executeAction() begins
+  ├─ Action: "click"
+  ├─ Target: "sign up button"
+  └─ Response: "Clicking on sign up button"
+
+[T=5195ms] Speak response
+  ├─ Call smartSpeak("Clicking on sign up button")
+  ├─ Set isSpeaking = true
+  ├─ Create utterance, select voice
+  ├─ speechSynthesis.speak(utterance)
+  └─ Audio starts: "Clicking on sign up button"
+
+[T=5200ms] Find matching element
+  ├─ Call findMatchingElement("sign up button", elementCache.buttons)
+  ├─ Loop through 15 cached buttons
+  ├─ Check button 1: text="Login" → no match
+  ├─ Check button 2: text="Sign Up" → MATCH!
+  │   ├─ Similarity score: 0.85
+  │   ├─ Element: <button class="btn-primary">Sign Up</button>
+  │   └─ Best match so far
+  ├─ Continue checking remaining buttons...
+  ├─ Final best match: <button class="btn-primary">Sign Up</button>
+  └─ Return element
+
+[T=5210ms] Highlight element
+  ├─ element.style.outline = '3px solid #ff6b6b'
+  ├─ element.style.boxShadow = '0 0 10px rgba(255,107,107,0.5)'
+  └─ Visual feedback shows on page
+
+[T=5220ms] Scroll to element
+  ├─ element.getBoundingClientRect() → visible in viewport
+  ├─ Already visible, skip scroll
+  └─ Element ready
+
+[T=5720ms] Click element (500ms delay)
+  ├─ element.click()
+  ├─ Browser fires click event
+  ├─ Page navigates to registration form or next step
+  └─ Log: "✅ Clicked: Sign Up"
+
+[T=5725ms] Store in context
+  ├─ contextManager.remember('click', 'sign up button', [element])
+  ├─ Update lastAction = 'click'
+  ├─ Update lastTarget = 'sign up button'
+  ├─ Update lastClickedElement = element
+  └─ Add to conversationHistory
+
+[T=6000ms] Speech finishes
+  ├─ utterance.onend fires
+  ├─ Set isSpeaking = false
+  └─ Ready for next command
+
+[T=7220ms] Remove highlight (2000ms after click)
+  ├─ element.style.outline = ''
+  ├─ element.style.boxShadow = ''
+  └─ Visual feedback removed
+
+[T=7500ms] recognition.onend fires (auto-restart)
+  ├─ Check isListening: true
+  ├─ Not speaking: true
+  ├─ Wait 300ms
+  └─ Call recognition.start()
+
+[T=7800ms] recognition.onstart fires
+  └─ System ready for next command
+
+RESULT: Button clicked successfully, page navigated, system ready for next command
+
+================================================================================
+
+EXAMPLE 2: SCROLLING DOWN A PAGE
+================================================================================
+
+Scenario: User wants to scroll down on a long article page
+
+[T=0ms] User already has voice control active (from previous session)
+  └─ System listening (🔴 red button visible)
+
+[T=0ms] USER SPEAKS: "Scroll down"
+
+[T=100ms] recognition.onresult fires
+  ├─ Transcript: "scroll down"
+  ├─ isFinal: true
+  └─ Call processCommand("scroll down")
+
+[T=110ms] processCommand() executes
+  ├─ Normalize: text = "scroll down"
+  ├─ Not conversational
+  └─ Call sendToSpacyServer("scroll down")
+
+[T=120ms] HTTP POST to localhost:5001/process
+  └─ Body: {"text": "scroll down", "page_title": "Article", "url": "..."}
+
+[T=150ms] spacy_server.py processes
+  ├─ doc = nlp("scroll down")
+  ├─ Tokens: ["scroll", "down"]
+  ├─ analyze_intent(): "scroll" keyword found
+  ├─ extract_entities(): direction = "down"
+  ├─ generate_response(): "Scrolling down"
+  └─ Return: {
+      "action": "scroll_down",
+      "target": "down",
+      "confidence": 0.98,
+      "response": "Scrolling down"
+    }
+
+[T=180ms] voiceControl.js receives response
+  └─ Call executeAction(actionData)
+
+[T=190ms] executeAction() for scroll_down
+  ├─ Speak: "Scrolling down"
+  ├─ No element highlighting needed
+  ├─ Calculate scroll amount: window.innerHeight * 0.8 = 600px
+  ├─ Execute: window.scrollBy({ top: 600, behavior: 'smooth' })
+  ├─ Page smoothly scrolls down 600px
+  └─ Store in context: lastAction = 'scroll_down'
+
+[T=190ms - T=800ms] Smooth scroll animation
+  └─ Page content moves up
+
+[T=800ms] Scroll complete
+  └─ Log: "✅ Scrolled down"
+
+[T=1000ms] Scroll event fires (debounced check)
+  ├─ scrollUpdateTimer triggers
+  ├─ Check cache age: 2000ms old
+  ├─ Log: "📜 Scroll detected - checking for new content"
+  └─ Call forceUpdateCache()
+
+[T=1050ms] Cache update completes
+  ├─ New elements loaded (lazy-load articles)
+  ├─ Cache updated: 18 buttons (was 15), 25 links (was 8)
+  └─ Log: "📦 Cache updated in 28.34ms: 18 buttons, 25 links, 7 other clickables"
+
+[T=1200ms] recognition.onend → auto-restart
+  └─ System ready for next command
+
+RESULT: Page scrolled down 600px, new content cached, ready for next command
+
+================================================================================
+
+EXAMPLE 3: OPENING DROPDOWN MENU AND CLICKING ITEM
+================================================================================
+
+Scenario: User wants to open a navigation dropdown and click "Settings"
+
+[T=0ms] User on dashboard.example.com (already welcomed)
+  └─ Voice control active, listening
+
+[T=0ms] USER SPEAKS: "Click on settings"
+
+[T=100ms] recognition.onresult
+  ├─ Transcript: "click on settings"
+  └─ Call processCommand("click on settings")
+
+[T=110ms] Send to NLP server
+  └─ POST localhost:5001/process
+
+[T=150ms] NLP processing
+  ├─ Intent: "click"
+  ├─ Target: "settings"
+  ├─ Response: "Clicking on settings"
+  └─ Return action data
+
+[T=180ms] executeAction("click", "settings")
+  ├─ Speak: "Clicking on settings"
+  └─ Call findMatchingElement("settings", elementCache.buttons)
+
+[T=185ms] Search for "settings" element
+  ├─ Check buttons: no direct "Settings" button visible
+  ├─ Check links: found <a>Settings</a> but inside closed dropdown
+  ├─ Element currently hidden (display: none)
+  └─ No match found in visible elements
+
+[T=190ms] No element found
+  ├─ Speak: "I couldn't find settings. Could you be more specific?"
+  └─ Log: "❌ No match found for: settings"
+
+[T=500ms] User tries again differently
+
+[T=500ms] USER SPEAKS: "Open account menu"
+
+[T=600ms] Process command → NLP
+  ├─ Intent: "click"
+  ├─ Target: "account menu"
+  └─ Response: "Opening account menu"
+
+[T=650ms] executeAction("click", "account menu")
+  ├─ findMatchingElement("account menu", elementCache.buttons)
+  ├─ Found: <button id="account-menu-btn">Account ▼</button>
+  └─ Match score: 0.82
+
+[T=660ms] Click account menu button
+  ├─ Highlight element
+  ├─ Scroll to view (already visible)
+  ├─ Wait 500ms
+  └─ element.click()
+
+[T=1160ms] Button clicked
+  ├─ Dropdown menu appears (JavaScript triggered)
+  ├─ DOM mutation detected
+  └─ MutationObserver fires
+
+[T=1165ms] MutationObserver detects change
+  ├─ Check mutations: added nodes detected
+  ├─ Check for important changes: <ul role="menu"> found
+  ├─ Important change: TRUE
+  ├─ Log: "⚡ Important DOM change detected - updating cache immediately"
+  └─ Call updateElementCache() (no debounce)
+
+[T=1166ms] Immediate cache update
+  ├─ Query elements again
+  ├─ Found new links in dropdown:
+  │   - <a>Profile</a>
+  │   - <a>Settings</a>  ← NOW VISIBLE!
+  │   - <a>Logout</a>
+  ├─ Add to elementCache.links
+  └─ Log: "📦 Cache updated in 12.56ms: 15 buttons, 11 links, 5 other clickables"
+
+[T=2000ms] Dropdown fully open and cached
+  └─ System ready
+
+[T=3000ms] USER SPEAKS: "Click on settings"
+
+[T=3100ms] Process command → NLP → executeAction
+
+[T=3150ms] findMatchingElement("settings", elementCache.links)
+  ├─ Check links in cache
+  ├─ Found: <a href="/settings">Settings</a>
+  ├─ Match score: 1.0 (exact match)
+  └─ Return element
+
+[T=3160ms] Click settings link
+  ├─ Highlight element (inside dropdown)
+  ├─ Scroll to view
+  ├─ Wait 500ms
+  └─ element.click()
+
+[T=3660ms] Link clicked
+  ├─ Browser navigates to /settings page
+  └─ Log: "✅ Clicked: Settings"
+
+[T=3665ms] Page navigation starts
+  ├─ beforeunload event fires
+  ├─ cleanup() called
+  ├─ Stop recognition
+  ├─ Cancel speech
+  └─ Log: "📄 Page unloading - cleaning up voice control"
+
+[T=3800ms] New page loads (/settings)
+  ├─ webNavigation.onCompleted fires in background.js
+  ├─ Auto re-inject voice control
+  └─ Call injectVoiceControl(tabId)
+
+[T=3900ms] Voice control re-injected on /settings page
+  ├─ Check domain: dashboard.example.com (still same domain)
+  ├─ Query welcomedDomains: ["...dashboard.example.com..."]
+  ├─ Already welcomed: TRUE
+  ├─ Log: "🔇 Skipping welcome message - already welcomed on this domain"
+  ├─ Start listening silently (no speech)
+  └─ System ready for commands
+
+RESULT: Dropdown opened, settings clicked, navigated to settings page,
+        voice control auto-restarted WITHOUT welcome message (same domain)
+
+================================================================================
+                        PERFORMANCE METRICS
+================================================================================
+
+TYPICAL LATENCIES:
+
+Voice Recognition:
+  - Silence detection: 500-1000ms after speaking stops
+  - Final transcript ready: 100-200ms after detection
+  - Total speech-to-text: 600-1200ms
+
+NLP Processing (spaCy):
+  - Simple commands (click, scroll): 20-50ms
+  - Complex commands (multi-entity): 50-150ms
+  - Network round-trip: 10-30ms (localhost)
+  - Total NLP pipeline: 40-200ms
+
+Action Execution:
+  - Element search: 5-20ms (cached)
+  - Highlight + scroll: 100-300ms
+  - Click delay: 500ms (intentional, for visual feedback)
+  - Total execution: 605-820ms
+
+Text-to-Speech:
+  - Short phrases (3-5 words): 1-2 seconds
+  - Medium phrases (8-12 words): 2-3 seconds
+  - Voice loading: 0-2000ms (first time only)
+
+DOM Operations:
+  - Cache update (small page): 10-30ms
+  - Cache update (large page): 30-100ms
+  - MutationObserver reaction: 0-200ms (debounced)
+  - Scroll detection: 1000ms (debounced)
+
+TOTAL END-TO-END LATENCY:
+  - User speaks "click button" → Button clicked
+  - Speech recognition: 800ms
+  - NLP processing: 100ms
+  - Response speech: 1500ms
+  - Element find + click: 800ms
+  - Total: ~3200ms (3.2 seconds)
+
+OPTIMIZATION STRATEGIES:
+  - Element caching: Avoid repeated DOM queries
+  - Smart debouncing: Immediate for important, delayed for normal
+  - Passive listeners: scroll, mousemove (non-blocking)
+  - Lazy updates: Only update cache when needed (age > 2s)
+  - Parallel operations: Speak while searching elements
+  - Preloading: Voices loaded on initialization
+
+================================================================================
+                            ERROR HANDLING
+================================================================================
+
+1. SPEECH RECOGNITION ERRORS
+
+   recognition.onerror (Line 1272-1310):
+   ├── Error: 'no-speech' → Speak "I didn't hear anything"
+   ├── Error: 'audio-capture' → Speak "Microphone not available"
+   ├── Error: 'not-allowed' → Speak "Microphone permission denied"
+   ├── Error: 'network' → Retry after 2 seconds
+   └── Error: 'aborted' → Normal stop, no action
+
+2. NLP SERVER ERRORS
+
+   sendToSpacyServer error handling (Line 820-850):
+   ├── Network error → Speak "Connection to NLP server failed"
+   ├── Timeout (5s) → Speak "Request timed out"
+   ├── Server error 500 → Speak "Server error occurred"
+   └── Invalid response → Log error, no action
+
+3. ELEMENT NOT FOUND
+
+   findMatchingElement returns null (Line 1050-1080):
+   ├── No match found → Speak "I couldn't find {target}"
+   ├── Multiple matches → Use best similarity score
+   └── Ambiguous match → Ask for clarification
+
+4. PERMISSION ERRORS
+
+   Microphone permission:
+   ├── Check: navigator.permissions.query({name: 'microphone'})
+   ├── Denied → Show UI message, disable voice control
+   └── Prompt → Request permission on first use
+
+5. PAGE NAVIGATION ERRORS
+
+   Cleanup failures:
+   ├── recognition.stop() error → Ignore (page unloading)
+   ├── speechSynthesis.cancel() error → Ignore
+   └── Re-injection fails → Retry on next navigation
+
+================================================================================
+                        SECURITY CONSIDERATIONS
+================================================================================
+
+1. CONTENT SECURITY POLICY (CSP)
+   - Extension uses inline scripts (allowed for extensions)
+   - API calls restricted to localhost (development)
+   - No eval() or unsafe practices
+
+2. PERMISSION MODEL
+   - Microphone: Required for speech recognition
+   - activeTab: Only active tab access
+   - storage: Local storage only
+   - No broad host permissions
+
+3. INPUT SANITIZATION
+   - All user speech sanitized before NLP
+   - No direct eval of commands
+   - Command whitelist in spaCy server
+
+4. DATA PRIVACY
+   - No speech data sent to external servers
+   - No user data persistence (except welcomed domains)
+   - All processing local (localhost)
+
+5. INJECTION PROTECTION
+   - Duplicate injection prevention (wsVoiceControlActive flag)
+   - Cooldown timers (2 seconds between injections)
+   - IIFE pattern prevents global scope pollution
+
+================================================================================
+                            TROUBLESHOOTING
+================================================================================
+
+COMMON ISSUES AND SOLUTIONS:
+
+Issue: Voice control not activating
+├── Check: Microphone permissions in chrome://settings/content
+├── Check: Extension enabled in chrome://extensions
+├── Check: NLP server running (localhost:5001)
+└── Solution: Reload extension, restart servers
+
+Issue: Commands not recognized
+├── Check: Speech recognition language (en-US)
+├── Check: Background noise (use quiet environment)
+├── Check: NLP server logs for processing errors
+└── Solution: Speak clearly, check server response
+
+Issue: Buttons not clicking
+├── Check: Element cache updated (console logs)
+├── Check: Button actually visible on page
+├── Check: Button text matches command
+└── Solution: Refresh cache, use exact button text
+
+Issue: Welcome message every page
+├── Check: Domain in welcomedDomains list
+├── Check: chrome.storage.local permissions
+└── Solution: Clear storage, reload extension
+
+Issue: Voice control stops after navigation
+├── Check: Auto re-injection enabled (background.js)
+├── Check: Cleanup handlers firing correctly
+├── Check: Console for injection logs
+└── Solution: Check webNavigation.onCompleted listener
+
+================================================================================
+                            CONCLUSION
+================================================================================
+
+This documentation covers the complete technical flow of WebSense-AI from
+user activation to command execution. The system uses a multi-layered
+architecture with Chrome Extension (frontend), Node.js API (middleware), and
+Python spaCy NLP (backend) to provide natural language voice control for web
+browsing.
+
+Key strengths:
+- Fast element caching with smart updates
+- Robust error handling and auto-recovery
+- Context-aware conversational interface
+- Smooth user experience with minimal latency
+- Secure local processing (no external API calls for voice)
+
+The three detailed examples demonstrate common use cases and show the exact
+execution flow with timing, function calls, and data transformations at each
+step.
+
+For developers: All function references include file locations and line numbers
+for easy code navigation and debugging.
+
+Last Updated: November 24, 2025
+Version: 1.0

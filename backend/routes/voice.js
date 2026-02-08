@@ -2,11 +2,28 @@ const express = require('express');
 const router = express.Router();
 const axios = require('axios');
 
-// spaCy NLP server configuration
+// NLP Engine Configuration
+const NLP_ENGINE = process.env.NLP_ENGINE || 'spacy'; // 'spacy' or 'mistral'
 const SPACY_SERVER_URL = process.env.SPACY_SERVER_URL || 'http://localhost:5001';
+const MISTRAL_SERVER_URL = process.env.MISTRAL_SERVER_URL || 'http://localhost:5002';
+const NLP_TIMEOUT = parseInt(process.env.NLP_TIMEOUT || '30000');
+
+// Log active NLP engine
+console.log(`🧠 NLP Engine: ${NLP_ENGINE.toUpperCase()}`);
+console.log(`📡 Server URL: ${NLP_ENGINE === 'mistral' ? MISTRAL_SERVER_URL : SPACY_SERVER_URL}`);
+
+// Get appropriate server URL
+function getNLPServerUrl() {
+  return NLP_ENGINE === 'mistral' ? MISTRAL_SERVER_URL : SPACY_SERVER_URL;
+}
+
+// Get engine name
+function getEngineName() {
+  return NLP_ENGINE === 'mistral' ? 'Mistral' : 'spaCy';
+}
 
 /**
- * Parse voice command using spaCy NLP
+ * Parse voice command using configured NLP engine (spaCy or Mistral)
  * POST /api/voice/parse
  * Body: { "text": "show all buttons" }
  */
@@ -21,37 +38,47 @@ router.post('/parse', async (req, res) => {
       });
     }
 
-    // Call spaCy server
-    const response = await axios.post(`${SPACY_SERVER_URL}/parse`, {
+    // Call NLP server (spaCy or Mistral)
+    const nlpServerUrl = getNLPServerUrl();
+    const response = await axios.post(`${nlpServerUrl}/parse`, {
       text: text.trim()
     }, {
-      timeout: 5000, // 5 second timeout
+      timeout: NLP_TIMEOUT,
       headers: {
         'Content-Type': 'application/json'
       }
     });
 
-    // Return parsed command
-    return res.json(response.data);
+    // Add engine info to response
+    const result = {
+      ...response.data,
+      engine: NLP_ENGINE,
+      success: true
+    };
+
+    return res.json(result);
 
   } catch (error) {
-    console.error('Error parsing command:', error.message);
+    console.error(`Error parsing command with ${getEngineName()}:`, error.message);
+    const nlpServerUrl = getNLPServerUrl();
 
-    // Handle spaCy server connection errors
+    // Handle server connection errors
     if (error.code === 'ECONNREFUSED') {
       return res.status(503).json({
         success: false,
         error: 'NLP service unavailable',
-        message: 'spaCy server is not running. Please start it on port 5001'
+        message: `${getEngineName()} server is not running at ${nlpServerUrl}`,
+        engine: NLP_ENGINE
       });
     }
 
     // Handle timeout
-    if (error.code === 'ETIMEDOUT') {
+    if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
       return res.status(504).json({
         success: false,
         error: 'NLP service timeout',
-        message: 'spaCy server took too long to respond'
+        message: `${getEngineName()} server took too long to respond`,
+        engine: NLP_ENGINE
       });
     }
 
@@ -59,7 +86,8 @@ router.post('/parse', async (req, res) => {
     return res.status(500).json({
       success: false,
       error: 'Failed to parse command',
-      message: error.message
+      message: error.message,
+      engine: NLP_ENGINE
     });
   }
 });
@@ -80,20 +108,26 @@ router.post('/batch-parse', async (req, res) => {
       });
     }
 
-    // Call spaCy server
-    const response = await axios.post(`${SPACY_SERVER_URL}/batch-parse`, {
+    // Call NLP server
+    const nlpServerUrl = getNLPServerUrl();
+    const response = await axios.post(`${nlpServerUrl}/batch-parse`, {
       commands
     }, {
-      timeout: 10000, // 10 second timeout for batch
+      timeout: NLP_TIMEOUT * 2, // Double timeout for batch
       headers: {
         'Content-Type': 'application/json'
       }
     });
 
-    return res.json(response.data);
+    const result = {
+      ...response.data,
+      engine: NLP_ENGINE
+    };
+
+    return res.json(result);
 
   } catch (error) {
-    console.error('Error in batch parsing:', error.message);
+    console.error(`Error in batch parsing with ${getEngineName()}:`, error.message);
 
     if (error.code === 'ECONNREFUSED') {
       return res.status(503).json({
