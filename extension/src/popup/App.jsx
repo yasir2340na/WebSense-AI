@@ -3,6 +3,7 @@ import './App.css';
 import VoiceTab from './tabs/VoiceTab';
 import HomeTab from './tabs/HomeTab';
 import SettingsTab from './tabs/SettingsTab';
+import FormFillTab from './tabs/FormFillTab';
 
 function App() {
   const [activeTab, setActiveTab] = useState('voice');
@@ -33,12 +34,19 @@ function App() {
         >
           ⚙️ Settings
         </button>
+        <button
+          className={`tab-button ${activeTab === 'formfill' ? 'active' : ''}`}
+          onClick={() => setActiveTab('formfill')}
+        >
+          📝 Form Fill
+        </button>
       </nav>
 
       <main className="app-content">
         {activeTab === 'home' && <HomeTab />}
         {activeTab === 'voice' && <VoiceTab />}
         {activeTab === 'settings' && <SettingsTab />}
+        {activeTab === 'formfill' && <FormFillTab />}
       </main>
 
       <footer className="app-footer">

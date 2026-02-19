@@ -40,6 +40,13 @@ async function buildExtension() {
     await fs.copy(voiceSrc, voiceDest);
     console.log('✅ VoiceControl script copied\n');
 
+    // Step 5: Copy formChatPanel content script
+    console.log('📋 Copying formChatPanel script...');
+    const chatPanelSrc = resolve(rootDir, 'src/content/formChatPanel.js');
+    const chatPanelDest = resolve(distDir, 'formChatPanel.js');
+    await fs.copy(chatPanelSrc, chatPanelDest);
+    console.log('✅ FormChatPanel script copied\n');
+
     console.log('🎉 Build completed successfully!');
     console.log(`📁 Extension ready in: ${distDir}`);
   } catch (error) {

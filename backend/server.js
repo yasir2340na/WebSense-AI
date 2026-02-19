@@ -16,10 +16,12 @@ app.use(morgan('dev'));
 // Import routes
 const voiceRoutes = require('./routes/voice');
 const healthRoutes = require('./routes/health');
+const formFillingRoutes = require('./routes/formFilling');
 
 // Routes
 app.use('/api/voice', voiceRoutes);
 app.use('/health', healthRoutes);
+app.use('/api', formFillingRoutes);
 
 // Root endpoint
 app.get('/', (req, res) => {
@@ -31,7 +33,10 @@ app.get('/', (req, res) => {
       voiceParse: '/api/voice/parse',
       voiceNavigate: '/api/voice/navigate',
       voiceBatchParse: '/api/voice/batch-parse',
-      nlpHealth: '/api/voice/nlp-health'
+      nlpHealth: '/api/voice/nlp-health',
+      formFill: '/api/form-fill',
+      formFillCorrection: '/api/form-fill/correction',
+      clearSession: '/api/form-fill/session/:sessionId'
     }
   });
 });

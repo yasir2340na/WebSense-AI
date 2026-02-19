@@ -3,6 +3,12 @@ flask==3.0.0
 flask-cors==4.0.0
 spacy>=3.7.0
 
+# LangChain dependencies for form filling
+langgraph>=0.2.0
+langchain>=0.2.0
+langchain-cohere>=0.3.0
+langchain-core>=0.2.0
+
 # Note: After installing requirements, download the spaCy model:
 # python -m spacy download en_core_web_sm
 # or for better accuracy (larger model):

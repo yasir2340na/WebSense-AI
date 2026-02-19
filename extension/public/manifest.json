@@ -19,10 +19,13 @@
   "background": {
     "service_worker": "background.js"
   },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "matches": ["https://*/*"],
+      "js": ["content.js", "formChatPanel.js"],
       "run_at": "document_idle"
     }
   ],
@@ -33,6 +36,13 @@
         "mac": "Command+Shift+V"
       },
       "description": "Toggle voice control on/off"
+    },
+    "toggle-form-fill": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+F",
+        "mac": "Command+Shift+F"
+      },
+      "description": "Start voice form filling"
     }
   },
   "permissions": [
