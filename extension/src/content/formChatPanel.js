@@ -2,21 +2,18 @@
  * WebSense-AI — Sliding Chat Panel for Voice Form Filling
  *
  * A chatbot-style sliding panel injected into every HTTPS page.
+ * This is a THIN CLIENT — all conversation orchestration (confirm, correct,
+ * spell) is handled by the LangGraph backend.  This panel only:
+ *   - Sends every user message to the backend
+ *   - Renders the returned bot_response.message
+ *   - Handles bot_response.action (fill DOM, spell aloud, etc.)
+ *
  * Features:
  *   - Detects all types of form fields on the page automatically
  *   - Persistent conversational chat that survives open/close
- *   - Confirmation step before filling ("Should I fill these?")
- *   - Voice correction: say "no" / "wrong" to fix a field
- *   - Spell-by-voice: bot asks you to spell, then confirms letter-by-letter
- *   - "Spell [field]" command: bot reads out any filled value letter-by-letter via TTS
  *   - Uses Shadow DOM for full style isolation
- *
- * Conversation States:
- *   IDLE        → waiting for user to speak/type form data
- *   CONFIRMING  → extracted fields shown, awaiting "yes" / "no"
- *   CORRECTING  → user said "no", bot asks which field is wrong
- *   SPELLING    → bot asked user to spell the correct value letter-by-letter
- *   SPELL_CONFIRM → bot spelled it back, awaiting "yes" / "no"
+ *   - Voice input via Web Speech API
+ *   - TTS feedback + letter-by-letter spelling
  *
  * Architecture:
  *   formChatPanel.js (this) ←→ background.js ←→ formFilling.js ←→ Python LangGraph chain
@@ -38,15 +35,6 @@
   const MIC_TIMEOUT = 60000; // 60s max listen time
   const DEBOUNCE_MS = 600;
   const TTS_SPELL_DELAY = 500; // ms between letters when spelling aloud
-  const YES_WORDS = ['yes', 'yeah', 'yep', 'yup', 'sure', 'ok', 'okay', 'correct', 'right', 'confirm', 'go ahead', 'fill it', 'do it', 'proceed'];
-  const NO_WORDS = ['no', 'nope', 'nah', 'wrong', 'mistake', 'incorrect', 'not right', 'change', 'fix', 'wait', 'stop'];
-
-  // Conversation states
-  const STATE_IDLE = 'IDLE';
-  const STATE_CONFIRMING = 'CONFIRMING';
-  const STATE_CORRECTING = 'CORRECTING';
-  const STATE_SPELLING = 'SPELLING';
-  const STATE_SPELL_CONFIRM = 'SPELL_CONFIRM';
 
   // ============================================================
   // STATE
@@ -60,13 +48,49 @@
   let detectedFields = [];
   let filledFields = {};
   let hasGreeted = false; // persistent chat: only greet once
+  let savedProfile = null; // loaded from encrypted storage
+  let tempDataOnly = false; // if true, clear data on submit/close
 
-  // Conversation state machine
-  let conversationState = STATE_IDLE;
-  let pendingPayload = null;   // payload waiting for confirmation
-  let correctingField = null;  // which field key is being corrected
-  let spellingValue = '';       // accumulated spelled letters
-  let lastPartialData = null;  // stored partial extraction from needs_input
+  // ── Field-by-field mode state ──
+  let fieldByFieldMode = false;        // true when walking through fields one by one
+  let essentialFields = [];             // filtered list of essential fields to fill
+  let currentFieldIndex = -1;           // index into essentialFields currently being asked
+  let awaitingFieldInput = false;       // true when waiting for user to answer current field
+
+  // ============================================================
+  // SAFE MESSAGE HELPER
+  // ============================================================
+
+  /**
+   * Safely sends a message to the background service worker.
+   * Returns a Promise that resolves with the response or null on error.
+   * Handles:
+   *   - chrome.runtime disconnected (extension reloaded)
+   *   - Service worker inactive (Manifest V3)
+   *   - chrome.runtime.lastError
+   */
+  function safeSendMessage(msg) {
+    return new Promise((resolve) => {
+      try {
+        if (!chrome.runtime?.id) {
+          console.warn('WebSense: Extension context invalidated');
+          resolve(null);
+          return;
+        }
+        chrome.runtime.sendMessage(msg, (resp) => {
+          if (chrome.runtime.lastError) {
+            console.warn('WebSense sendMessage error:', chrome.runtime.lastError.message);
+            resolve(null);
+            return;
+          }
+          resolve(resp);
+        });
+      } catch (err) {
+        console.warn('WebSense sendMessage threw:', err.message);
+        resolve(null);
+      }
+    });
+  }
 
   // ============================================================
   // SHADOW DOM HOST
@@ -512,12 +536,6 @@
       .replace(/\b\w/g, (c) => c.toUpperCase());
   }
 
-  /** Check if text matches any word list */
-  function matchesAny(text, wordList) {
-    const lower = text.toLowerCase().trim();
-    return wordList.some((w) => lower === w || lower.startsWith(w + ' ') || lower.endsWith(' ' + w) || lower.includes(w));
-  }
-
   // ============================================================
   // TEXT-TO-SPEECH (TTS) ENGINE
   // ============================================================
@@ -750,6 +768,23 @@
     return fields;
   }
 
+  // ============================================================
+  // FIELD FILTER — ALL VISIBLE FIELDS FOR FIELD-BY-FIELD MODE
+  // ============================================================
+
+  /**
+   * Returns ALL visible form fields for field-by-field guided filling.
+   * Each field gets a pretty _essentialLabel derived from its label/placeholder/name/id.
+   * Hidden fields and submit/button fields are excluded.
+   */
+  function getAllFormFields(allFields) {
+    const visible = allFields.filter((f) => f.isVisible);
+    return visible.map((f) => ({
+      ...f,
+      _essentialLabel: prettyName(f.label || f.placeholder || f.name || f.id || 'Field'),
+    }));
+  }
+
   /**
    * Classifies what kind of form this is based on detected fields.
    */
@@ -812,11 +847,6 @@
   function doFormScan() {
     chatArea.innerHTML = '';
     filledFields = {};
-    conversationState = STATE_IDLE;
-    pendingPayload = null;
-    correctingField = null;
-    spellingValue = '';
-    lastPartialData = null;
     detectedFields = deepScanFields();
 
     if (detectedFields.length === 0) {
@@ -842,25 +872,247 @@
       }
     });
 
-    const greeting =
-      `👋 Hi! I'm your <b>Form Assistant</b>.<br><br>` +
-      `${formInfo.icon} I detected a <b>${formInfo.type} Form</b> with <b>${fieldCount} field${fieldCount > 1 ? 's' : ''}</b>:`;
-
-    addMessage(greeting + buildFieldChips(visibleFields), 'bot', '', true);
-
-    addMessage(
-      `🎤 <b>Start speaking</b> to fill the form — for example:<br><br>` +
-      `<i>"My name is Ahmed Khan and my email is ahmed@example.com"</i><br><br>` +
-      `Or type your info below. I'll show you what I captured and ask for confirmation before filling!<br><br>` +
-      `💡 <b>Tips:</b><br>` +
-      `• Say <b>"spell name"</b> to hear any filled field spelled out<br>` +
-      `• Say <b>"no"</b> after I show values to correct mistakes<br>` +
-      `• I'll ask you to spell corrections letter by letter`,
-      'bot', '', false
-    );
-
     setStatus(`${formInfo.icon} ${formInfo.type} Form · ${fieldCount} fields detected`);
     updateFabBadge(fieldCount);
+
+    // Compute all form fields for field-by-field mode
+    essentialFields = getAllFormFields(detectedFields);
+    currentFieldIndex = -1;
+    fieldByFieldMode = false;
+    awaitingFieldInput = false;
+
+    // Build the field list for the greeting
+    const essentialNames = essentialFields.map(f => f._essentialLabel).join(', ');
+
+    // SRS Flow: Check for saved profile first
+    safeSendMessage({ type: 'LOAD_FORM_PROFILE', userId: 'default_user' }).then((resp) => {
+      if (resp && resp.success && resp.profile && Object.keys(resp.profile).length > 0) {
+        savedProfile = resp.profile;
+        const greeting =
+          `👋 Hi! I'm your <b>Form Assistant</b>.<br><br>` +
+          `${formInfo.icon} I detected a <b>${formInfo.type} Form</b> with <b>${fieldCount} field${fieldCount > 1 ? 's' : ''}</b>.<br><br>` +
+          `I found these important fields: <b>${essentialNames}</b><br><br>` +
+          `✅ I have your details saved from last time!`;
+
+        addMessage(greeting + buildFieldChips(visibleFields), 'bot', '', true);
+
+        const summaryLines = Object.entries(savedProfile).map(
+          ([k, v]) => `• <b>${prettyName(k)}</b>: ${v}`
+        ).join('<br>');
+
+        addMessage(
+          `📋 Saved details:<br><br>${summaryLines}<br><br>` +
+          `👉 <b>Should I fill the form with these saved details?</b><br>` +
+          `Say <b>"yes"</b> to auto-fill, <b>"no"</b> to enter new data, or <b>"by voice"</b> to fill by voice.`,
+          'bot', '', true
+        );
+        savedProfilePendingDecision = true;
+      } else {
+        savedProfile = null;
+        const greeting =
+          `👋 Hi! I'm your <b>Form Assistant</b>.<br><br>` +
+          `${formInfo.icon} I detected a <b>${formInfo.type} Form</b> with <b>${fieldCount} field${fieldCount > 1 ? 's' : ''}</b>.<br><br>` +
+          `I found these fields: <b>${essentialNames}</b>`;
+
+        addMessage(greeting + buildFieldChips(visibleFields), 'bot', '', true);
+
+        // Auto-start field-by-field mode immediately
+        startFieldByField();
+      }
+    });
+  }
+
+  // Track whether we're waiting for saved-profile decision
+  let savedProfilePendingDecision = false;
+
+  // ============================================================
+  // FIELD-BY-FIELD HELPERS
+  // ============================================================
+
+  /**
+   * Starts the field-by-field guided fill mode.
+   * Asks the user for the first essential field.
+   */
+  function startFieldByField() {
+    fieldByFieldMode = true;
+    currentFieldIndex = 0;
+    awaitingFieldInput = false;
+
+    if (essentialFields.length === 0) {
+      addMessage('⚠️ I couldn\'t identify any fillable fields on this form.', 'bot', '', true);
+      fieldByFieldMode = false;
+      return;
+    }
+
+    askCurrentField();
+  }
+
+  /**
+   * Asks the user for the value of the current field.
+   * Skips fields that already have a value.
+   */
+  function askCurrentField() {
+    // Skip already-filled fields
+    while (currentFieldIndex < essentialFields.length) {
+      const f = essentialFields[currentFieldIndex];
+      const key = f.name || f.id;
+      if (f.currentValue || filledFields[key]) {
+        // Already has a value — skip silently
+        if (!filledFields[key] && f.currentValue) filledFields[key] = f.currentValue;
+        currentFieldIndex++;
+        continue;
+      }
+      break;
+    }
+
+    if (currentFieldIndex >= essentialFields.length) {
+      // All fields done!
+      onAllFieldsFilled();
+      return;
+    }
+
+    const field = essentialFields[currentFieldIndex];
+    const label = field._essentialLabel;
+    const stepText = `${currentFieldIndex + 1}/${essentialFields.length}`;
+
+    let askText;
+    if (currentFieldIndex === 0) {
+      askText =
+        `📝 Let's fill your form step by step! (${stepText})<br><br>` +
+        `👉 I'm now on the <b>${label}</b> field.<br>` +
+        `What is your <b>${label}</b>?`;
+    } else {
+      const prevField = essentialFields[currentFieldIndex - 1];
+      askText =
+        `✅ I've filled <b>${prevField._essentialLabel}</b>.<br><br>` +
+        `👉 Now I'm on the <b>${label}</b> field. (${stepText})<br>` +
+        `What is your <b>${label}</b>?`;
+    }
+
+    addMessage(askText, 'bot', '', true);
+    setStatus(`Step ${stepText}: ${label}`);
+    awaitingFieldInput = true;
+  }
+
+  /**
+   * Fills a single field in the DOM by sending it through the background → content.js pipeline.
+   */
+  async function fillSingleField(field, value) {
+    const key = field.name || field.id;
+    const fieldsToFill = {
+      [key]: {
+        value,
+        confidence: 1.0,
+        selectors: field.selector ? [field.selector] : _buildSelectorsForKey(key),
+      },
+    };
+
+    const fillResp = await safeSendMessage({
+      type: 'EXECUTE_CHAT_FILL',
+      fieldsToFill,
+      summary: { [key]: value },
+      tabId: 'current',
+    });
+    if (!fillResp) {
+      console.warn('WebSense: fillSingleField — no response from background');
+    }
+
+    // Track locally
+    filledFields[key] = value;
+  }
+
+  /**
+   * Called when all essential fields have been filled.
+   */
+  function onAllFieldsFilled() {
+    fieldByFieldMode = false;
+    awaitingFieldInput = false;
+    currentFieldIndex = -1;
+
+    const visibleFields = detectedFields.filter((f) => f.isVisible);
+
+    // Show summary of what was filled
+    const summaryLines = essentialFields.map((f) => {
+      const key = f.name || f.id;
+      return `✅ <b>${f._essentialLabel}</b>: ${filledFields[key] || '(empty)'}`;
+    }).join('<br>');
+
+    addMessage(
+      `🎉 <b>Form successfully filled!</b><br><br>${summaryLines}` +
+      buildFieldChips(visibleFields),
+      'bot', '', true
+    );
+    setStatus('Form successfully filled ✓', 'success');
+
+    // SRS: ask to save
+    addMessage(
+      '💾 <b>Would you like to save these details for future forms?</b><br><br>' +
+      'Say <b>"yes"</b> to securely store in encrypted local storage, or <b>"no"</b> to use temporarily.',
+      'bot', '', true
+    );
+    awaitingSaveDecision = true;
+  }
+
+  /**
+   * Build CSS selectors for a field key when auto-filling from saved profile.
+   * Matches against detected page fields.
+   */
+  function _buildSelectorsForKey(key) {
+    const selectors = [];
+    const keyLower = key.toLowerCase();
+    for (const f of detectedFields) {
+      const matchTargets = [
+        f.name?.toLowerCase(), f.id?.toLowerCase(),
+        f.placeholder?.toLowerCase(), f.label?.toLowerCase(),
+        f.autocomplete?.toLowerCase(), f.ariaLabel?.toLowerCase(),
+      ].filter(Boolean);
+
+      const keyVariants = [
+        keyLower, keyLower.replace(/_/g, ''), keyLower.replace(/[_-]/g, ' '),
+      ];
+
+      const matched = matchTargets.some(t =>
+        keyVariants.some(kv => t.includes(kv) || kv.includes(t))
+      );
+
+      if (matched && f.selector) {
+        selectors.push(f.selector);
+      }
+    }
+    // Fallback generic selectors
+    if (selectors.length === 0) {
+      selectors.push(
+        `[name*="${key}" i]`, `[id*="${key}" i]`,
+        `[placeholder*="${key}" i]`, `[aria-label*="${key}" i]`
+      );
+    }
+    return selectors;
+  }
+
+  /**
+   * Sets up listeners to clear temporary data on form submit or tab close.
+   */
+  function setupTempDataCleanup() {
+    // Clear on form submit
+    const forms = document.querySelectorAll('form');
+    forms.forEach((form) => {
+      form.addEventListener('submit', () => {
+        if (tempDataOnly) {
+          filledFields = {};
+          addMessage('🗑️ Temporary data cleared after form submission.', 'bot', '', false);
+          // Notify background to clear session
+          safeSendMessage({ type: 'CLEAR_FORM_SESSION', sessionId });
+        }
+      }, { once: true });
+    });
+
+    // Clear on visibility change (tab close handled by background.js)
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && tempDataOnly) {
+        filledFields = {};
+        safeSendMessage({ type: 'CLEAR_FORM_SESSION', sessionId });
+      }
+    });
   }
 
   function updateFabBadge(count) {
@@ -987,39 +1239,11 @@
   }
 
   // ============================================================
-  // BUILD PAYLOAD FROM PARTIAL (convert needs_input partial to fill-ready payload)
-  // ============================================================
-
-  function buildPayloadFromPartial(partial) {
-    const fieldsToFill = {};
-    const summary = {};
-
-    for (const [fieldName, fieldData] of Object.entries(partial)) {
-      const value = typeof fieldData === 'object' ? (fieldData.value || '') : fieldData;
-      if (!value) continue;
-
-      fieldsToFill[fieldName] = typeof fieldData === 'object'
-        ? { ...fieldData }
-        : { value: fieldData, confidence: 0.8, selectors: [], source_text: '' };
-
-      summary[fieldName] = value;
-    }
-
-    return {
-      status: 'success',
-      fields_to_fill: fieldsToFill,
-      summary,
-      missing_fields: [],
-      needs_confirmation: false,
-      sensitive_detected: false,
-    };
-  }
-
-  // ============================================================
-  // PROCESS USER INPUT — State Machine Router
+  // PROCESS USER INPUT — Thin Client (all logic on backend)
   // ============================================================
 
   let processingLock = false;
+  let awaitingSaveDecision = false; // track if we're waiting for save yes/no
 
   async function processUserInput(text) {
     if (!text.trim() || processingLock) return;
@@ -1030,63 +1254,138 @@
     textInput.value = '';
     sendBtn.disabled = true;
 
+    const lower = text.toLowerCase().trim();
+
+    // ── Handle "save for future?" decision ──
+    if (awaitingSaveDecision) {
+      awaitingSaveDecision = false;
+      const isYes = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'save', 'yes please'].some(w => lower.includes(w));
+      const isNo = ['no', 'nope', 'nah', 'don\'t', 'not', 'skip', 'no thanks'].some(w => lower.includes(w));
+
+      if (isYes) {
+        // Save profile encrypted
+        tempDataOnly = false;
+        safeSendMessage({
+          type: 'SAVE_FORM_PROFILE',
+          userId: 'default_user',
+          profileData: { ...filledFields },
+        }).then((resp) => {
+          if (resp && resp.success) {
+            addMessage('✅ <b>Details saved securely!</b> Your data is encrypted and stored locally. It will be available for future forms.', 'bot', '', true);
+          } else {
+            addMessage('⚠️ Could not save data. Please try again.', 'bot', '', true);
+          }
+        });
+        setStatus('Profile saved ✓', 'success');
+      } else {
+        // Temporary only — will clear on submit/tab close
+        tempDataOnly = true;
+        addMessage(
+          '👍 No problem! Your data will be used <b>temporarily</b> and cleared after the form is submitted or the tab is closed.',
+          'bot', '', true
+        );
+        setStatus('Temporary data — will clear on submit/close');
+
+        // Set up form submit listener to clear temp data
+        setupTempDataCleanup();
+      }
+
+      processingLock = false;
+      return;
+    }
+
+    // ── Handle saved-profile decision (yes/no/voice) ──
+    if (savedProfilePendingDecision) {
+      savedProfilePendingDecision = false;
+      const isYes = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'fill', 'autofill', 'auto'].some(w => lower.includes(w));
+      const isVoice = ['voice', 'speak', 'mic', 'microphone', 'by voice'].some(w => lower.includes(w));
+      const isNo = ['no', 'nope', 'nah', 'new', 'different', 'manual', 'type', 'fresh'].some(w => lower.includes(w));
+
+      if (isYes && savedProfile) {
+        // Auto-fill from saved profile
+        addMessage('⏳ Filling form with saved details...', 'bot', '', true);
+
+        // Build fill payload from saved profile
+        const fieldsToFill = {};
+        for (const [key, value] of Object.entries(savedProfile)) {
+          fieldsToFill[key] = {
+            value,
+            confidence: 1.0,
+            selectors: _buildSelectorsForKey(key),
+          };
+        }
+
+        await executeFill(fieldsToFill, savedProfile);
+        addMessage('✅ <b>Form successfully filled</b> using your saved details!', 'bot', '', true);
+        setStatus('Form filled from saved profile ✓', 'success');
+
+        processingLock = false;
+        return;
+      } else if (isVoice || isNo) {
+        // User wants to enter new data — start field-by-field mode
+        addMessage(
+          `🎤 <b>Great!</b> I'll walk you through each field one by one.<br>` +
+          `Speak or type your answer for each field.`,
+          'bot', '', true
+        );
+        startFieldByField();
+        processingLock = false;
+        return;
+      }
+      // If unclear input, fall through to normal processing
+    }
+
+    // ── Handle field-by-field input ──
+    if (awaitingFieldInput && fieldByFieldMode) {
+      awaitingFieldInput = false;
+      const field = essentialFields[currentFieldIndex];
+      const value = text.trim();
+
+      // Allow skipping optional fields
+      if (['skip', 'next', 'pass', 'leave blank', 'leave empty'].some(w => lower.includes(w))) {
+        addMessage(`⏭️ Skipping <b>${field._essentialLabel}</b>.`, 'bot', '', true);
+        currentFieldIndex++;
+        askCurrentField();
+        processingLock = false;
+        return;
+      }
+
+      if (!value) {
+        addMessage('⚠️ Please provide a value for <b>' + field._essentialLabel + '</b>, or say <b>"skip"</b> to leave it blank.', 'bot', '', true);
+        awaitingFieldInput = true;
+        processingLock = false;
+        return;
+      }
+
+      // Fill this single field in the DOM
+      await fillSingleField(field, value);
+
+      // Move to next field
+      currentFieldIndex++;
+      askCurrentField();
+      processingLock = false;
+      return;
+    }
+
+    // ── If not in field-by-field mode but we have form fields, auto-start it ──
+    if (!fieldByFieldMode && essentialFields.length > 0) {
+      startFieldByField();
+      processingLock = false;
+      return;
+    }
+
     if (detectedFields.length === 0) {
       addMessage('⚠️ No form fields detected on this page. Click 🔄 to scan again.', 'bot', '', true);
       processingLock = false;
       return;
     }
 
-    const lower = text.toLowerCase().trim();
-
-    // ---- Route based on conversation state ----
-
-    if (conversationState === STATE_CONFIRMING) {
-      await handleConfirmation(lower);
-      processingLock = false;
-      return;
-    }
-
-    if (conversationState === STATE_CORRECTING) {
-      await handleCorrection(lower);
-      processingLock = false;
-      return;
-    }
-
-    if (conversationState === STATE_SPELLING) {
-      await handleSpelling(lower);
-      processingLock = false;
-      return;
-    }
-
-    if (conversationState === STATE_SPELL_CONFIRM) {
-      await handleSpellConfirm(lower);
-      processingLock = false;
-      return;
-    }
-
-    // ---- Check for "spell <field>" command in IDLE state ----
-    const spellMatch = lower.match(/^spell\s+(.+)/);
-    if (spellMatch) {
-      await handleSpellCommand(spellMatch[1]);
-      processingLock = false;
-      return;
-    }
-
-    // ---- IDLE: user saying "yes"/"confirm" when we have partial data → fill with partial ----
-    if (lastPartialData && matchesAny(lower, YES_WORDS)) {
-      const payload = buildPayloadFromPartial(lastPartialData);
-      lastPartialData = null;
-      await showFillConfirmation(payload);
-      processingLock = false;
-      return;
-    }
-
-    // ---- Default: IDLE → send to backend for extraction ----
     const removeTyping = showTyping();
-    setStatus('🔄 Processing your input...', '');
+    setStatus('🔄 Processing…', '');
 
     try {
-      const response = await chrome.runtime.sendMessage({
+      // Send message to the backend — the LangGraph router decides what to do
+      const response = await safeSendMessage({
         type: 'CHAT_FORM_FILL',
         transcript: text,
         sessionId,
@@ -1095,34 +1394,56 @@
 
       removeTyping();
 
-      if (!response || !response.success) {
-        const errMsg = response?.message || response?.error || 'Something went wrong';
+      if (!response || response.action === 'error') {
+        const errMsg = response?.message || 'Something went wrong';
         addMessage(`⚠️ ${errMsg}`, 'bot', '', true);
-        setStatus('Error processing input', 'error');
+        setStatus('Error', 'error');
         processingLock = false;
         return;
       }
 
-      if (response.status === 'needs_input') {
-        if (response.partial && Object.keys(response.partial).length > 0) {
-          // Store partial so user can confirm it later
-          lastPartialData = response.partial;
-          showPartialFill(response.partial);
-          addMessage(
-            `👉 Say <b>"yes"</b> or <b>"confirm"</b> to fill with what I have, ` +
-            `or provide the missing info.`,
-            'bot', '', true
-          );
-        } else {
-          addMessage(`🤔 ${response.question || 'Could you provide more details?'}`, 'bot', '', true);
-        }
-        setStatus('Waiting for more information...', '');
-      } else if (response.status === 'ready') {
-        // Don't fill yet — show summary and ask for confirmation
-        await showFillConfirmation(response.payload);
-      } else {
-        addMessage('⚠️ Unexpected response. Please try again.', 'bot', '', true);
+      // ── Render the bot message ──
+      if (response.message) {
+        const shouldSpeak = !!response.speak_text;
+        addMessage(response.message, 'bot', '', shouldSpeak);
       }
+
+      // ── Update status bar ──
+      if (response.status_text) {
+        setStatus(response.status_text);
+      }
+
+      // ── Handle action-specific behaviour ──
+      switch (response.action) {
+        case 'execute_fill':
+          await executeFill(response.fields_to_fill, response.summary || response.fields_summary || {});
+          break;
+
+        case 'spell_readout':
+          if (response.spell_aloud) {
+            await spellAloud(response.spell_aloud.field, response.spell_aloud.value);
+          }
+          break;
+
+        case 'ask_spelling':
+        case 'confirm_spelling':
+          // Optionally spell aloud the current / new value
+          if (response.spell_aloud) {
+            await spellAloud(response.spell_aloud.field, response.spell_aloud.value);
+          }
+          break;
+
+        case 'confirm_fill':
+        case 'ask_correction':
+        case 'show_fields':
+          // Message already displayed — nothing extra to do
+          break;
+
+        default:
+          // Unknown action — message already shown
+          break;
+      }
+
     } catch (err) {
       removeTyping();
       console.error('WebSense chat error:', err);
@@ -1134,368 +1455,35 @@
   }
 
   // ============================================================
-  // SHOW FILL CONFIRMATION (ask before filling)
+  // EXECUTE FILL (fill DOM fields via background → content.js)
   // ============================================================
 
-  async function showFillConfirmation(payload) {
-    const fieldsToFill = payload.fields_to_fill || {};
-    const summary = payload.summary || {};
-    const fieldCount = Object.keys(fieldsToFill).length;
-
-    if (fieldCount === 0) {
-      addMessage("⚠️ I couldn't map any values to form fields. Try being more specific.", 'bot', '', true);
-      return;
-    }
-
-    // Store for later
-    pendingPayload = payload;
-
-    // Build summary preview
-    const filledList = Object.entries(summary)
-      .filter(([, v]) => v)
-      .map(([k, v]) => `<div class="ws-summary-row"><span class="label">${prettyName(k)}</span><span class="value">${v}</span></div>`)
-      .join('');
-
-    addMessage(
-      `📋 Here's what I captured (<b>${fieldCount}</b> field${fieldCount > 1 ? 's' : ''}):\n` +
-      (filledList ? `<div class="ws-summary">${filledList}</div>` : '') +
-      `<br>👉 <b>Should I fill these fields?</b> Say <b>yes</b> to fill, or <b>no</b> to correct.`,
-      'bot', '', true
-    );
-
-    conversationState = STATE_CONFIRMING;
-    setStatus('Waiting for confirmation…');
-  }
-
-  // ============================================================
-  // HANDLE CONFIRMATION (yes → fill, no → correction mode)
-  // ============================================================
-
-  async function handleConfirmation(text) {
-    if (matchesAny(text, YES_WORDS)) {
-      conversationState = STATE_IDLE;
-      await doActualFill(pendingPayload);
-      pendingPayload = null;
-    } else if (matchesAny(text, NO_WORDS)) {
-      conversationState = STATE_CORRECTING;
-      addMessage(
-        `🔧 No problem! Which field is wrong?<br><br>` +
-        `Tell me the field name — for example:<br>` +
-        `<i>"name is wrong"</i> or <i>"fix email"</i> or just say the field name.`,
-        'bot', '', true
-      );
-      setStatus('Correction mode — tell me which field');
-    } else {
-      addMessage(
-        `🤔 I didn't catch that. Please say <b>yes</b> to fill or <b>no</b> to correct a mistake.`,
-        'bot', '', true
-      );
-    }
-  }
-
-  // ============================================================
-  // HANDLE CORRECTION (identify which field to fix)
-  // ============================================================
-
-  async function handleCorrection(text) {
-    // Try to find the field name the user mentioned
-    const summary = pendingPayload?.summary || {};
-    const fieldsToFill = pendingPayload?.fields_to_fill || {};
-    const allKeys = [...new Set([...Object.keys(summary), ...Object.keys(fieldsToFill)])];
-
-    let matchedField = null;
-    const lower = text.toLowerCase();
-
-    // Direct key match
-    for (const key of allKeys) {
-      if (lower.includes(key.toLowerCase()) || lower.includes(prettyName(key).toLowerCase())) {
-        matchedField = key;
-        break;
-      }
-    }
-
-    // Fuzzy match common words
-    if (!matchedField) {
-      const commonFieldWords = {
-        name: ['name', 'username', 'first', 'last', 'full'],
-        email: ['email', 'mail', 'e-mail'],
-        phone: ['phone', 'mobile', 'tel', 'number'],
-        password: ['password', 'pass'],
-        address: ['address', 'street', 'city', 'zip'],
-      };
-      for (const key of allKeys) {
-        const keyLower = key.toLowerCase();
-        for (const [, words] of Object.entries(commonFieldWords)) {
-          if (words.some((w) => keyLower.includes(w) && lower.includes(w))) {
-            matchedField = key;
-            break;
-          }
-        }
-        if (matchedField) break;
-      }
-    }
-
-    if (!matchedField) {
-      // List available fields so user can pick
-      const fieldList = allKeys.map((k) => {
-        const val = summary[k] || '';
-        return `• <b>${prettyName(k)}</b>: ${val}`;
-      }).join('<br>');
-
-      addMessage(
-        `🤔 I'm not sure which field you mean. Here are the current values:<br><br>` +
-        fieldList + `<br><br>Please say the field name you want to correct.`,
-        'bot', '', true
-      );
-      return;
-    }
-
-    correctingField = matchedField;
-    spellingValue = '';
-    conversationState = STATE_SPELLING;
-
-    const currentVal = summary[matchedField] || fieldsToFill[matchedField]?.value || fieldsToFill[matchedField] || '';
-
-    // Spell out the current value so user knows what's there
-    addMessage(
-      `📝 Current value for <b>${prettyName(matchedField)}</b>: <b>${currentVal}</b><br><br>` +
-      `Let me spell it out for you…`,
-      'bot', '', true
-    );
-
-    await spellAloud(prettyName(matchedField), currentVal);
-
-    addMessage(
-      `🔤 Now please tell me the correct spelling, letter by letter.<br>` +
-      `For example: <i>"A H M E D"</i><br><br>` +
-      `When you're done, say <b>"done"</b> or <b>"finished"</b>.`,
-      'bot', '', true
-    );
-    setStatus(`Spelling mode — correct "${prettyName(matchedField)}"`);
-  }
-
-  // ============================================================
-  // HANDLE SPELLING (collect letters from user)
-  // ============================================================
-
-  async function handleSpelling(text) {
-    const lower = text.toLowerCase().trim();
-
-    // Check for "done" / "finished" to end spelling
-    if (['done', 'finished', 'that is it', "that's it", 'stop', 'end', 'okay'].includes(lower)) {
-      if (!spellingValue.trim()) {
-        addMessage('⚠️ You haven\'t spelled anything yet. Please say the letters, or say <b>"cancel"</b> to go back.', 'bot', '', true);
-        return;
-      }
-
-      conversationState = STATE_SPELL_CONFIRM;
-
-      addMessage(
-        `📝 I got: <b>${spellingValue.trim()}</b><br><br>` +
-        `Let me spell it back for confirmation…`,
-        'bot', '', true
-      );
-
-      await spellAloud(prettyName(correctingField), spellingValue.trim());
-
-      addMessage(
-        `👉 Is <b>${spellingValue.trim()}</b> correct? Say <b>yes</b> to apply or <b>no</b> to spell again.`,
-        'bot', '', true
-      );
-      setStatus('Confirm spelling…');
-      return;
-    }
-
-    // Check for "cancel"
-    if (['cancel', 'back', 'never mind', 'nevermind'].includes(lower)) {
-      conversationState = STATE_CONFIRMING;
-      spellingValue = '';
-      correctingField = null;
-      addMessage('↩️ Cancelled. Should I fill the original values? Say <b>yes</b> or <b>no</b>.', 'bot', '', true);
-      return;
-    }
-
-    // Parse letters: "A H M E D" or "a, h, m, e, d" or "ahmed" (whole word)
-    const letters = text.replace(/[,.\s]+/g, ' ').trim();
-
-    // If it looks like individual letters (single chars separated by spaces),
-    // treat each as a letter; otherwise treat as a whole word replacement
-    const parts = letters.split(/\s+/);
-    const allSingleChars = parts.every((p) => p.length === 1);
-
-    if (allSingleChars) {
-      spellingValue += parts.join('');
-      addMessage(`🔤 Got it: <b>${spellingValue}</b> (say more letters, or <b>"done"</b> when finished)`, 'bot', '', false);
-    } else {
-      // User said a whole word — replace entirely
-      spellingValue = text.trim();
-      conversationState = STATE_SPELL_CONFIRM;
-
-      addMessage(
-        `📝 I got: <b>${spellingValue}</b><br>Let me spell it back…`,
-        'bot', '', true
-      );
-      await spellAloud(prettyName(correctingField), spellingValue);
-
-      addMessage(
-        `👉 Is <b>${spellingValue}</b> correct? Say <b>yes</b> or <b>no</b>.`,
-        'bot', '', true
-      );
-      setStatus('Confirm spelling…');
-    }
-  }
-
-  // ============================================================
-  // HANDLE SPELL CONFIRM (yes → apply correction, no → re-spell)
-  // ============================================================
-
-  async function handleSpellConfirm(text) {
-    if (matchesAny(text, YES_WORDS)) {
-      // Apply correction to pending payload
-      if (pendingPayload) {
-        if (pendingPayload.summary && correctingField in pendingPayload.summary) {
-          pendingPayload.summary[correctingField] = spellingValue.trim();
-        }
-        if (pendingPayload.fields_to_fill && correctingField in pendingPayload.fields_to_fill) {
-          const entry = pendingPayload.fields_to_fill[correctingField];
-          if (typeof entry === 'object') {
-            entry.value = spellingValue.trim();
-          } else {
-            pendingPayload.fields_to_fill[correctingField] = spellingValue.trim();
-          }
-        }
-      }
-
-      addMessage(
-        `✅ Updated <b>${prettyName(correctingField)}</b> to <b>${spellingValue.trim()}</b>!`,
-        'bot', '', true
-      );
-
-      // Reset and go back to confirmation
-      spellingValue = '';
-      correctingField = null;
-      conversationState = STATE_CONFIRMING;
-
-      // Show updated summary
-      const summary = pendingPayload?.summary || {};
-      const filledList = Object.entries(summary)
-        .filter(([, v]) => v)
-        .map(([k, v]) => `<div class="ws-summary-row"><span class="label">${prettyName(k)}</span><span class="value">${v}</span></div>`)
-        .join('');
-
-      addMessage(
-        `📋 Updated values:\n<div class="ws-summary">${filledList}</div><br>` +
-        `👉 <b>Should I fill these now?</b> Say <b>yes</b> to fill or <b>no</b> to correct another field.`,
-        'bot', '', true
-      );
-      setStatus('Waiting for confirmation…');
-
-    } else if (matchesAny(text, NO_WORDS)) {
-      spellingValue = '';
-      conversationState = STATE_SPELLING;
-      addMessage(
-        `🔄 Let's try again. Please spell <b>${prettyName(correctingField)}</b> letter by letter.<br>` +
-        `Say <b>"done"</b> when finished.`,
-        'bot', '', true
-      );
-      setStatus(`Re-spelling "${prettyName(correctingField)}"…`);
-    } else {
-      addMessage('🤔 Please say <b>yes</b> to apply the correction, or <b>no</b> to spell again.', 'bot', '', true);
-    }
-  }
-
-  // ============================================================
-  // HANDLE "SPELL <field>" COMMAND (read filled value aloud)
-  // ============================================================
-
-  async function handleSpellCommand(fieldText) {
-    const lower = fieldText.toLowerCase().trim();
-
-    // Search through filled fields and pending payload
-    const allData = { ...filledFields, ...(pendingPayload?.summary || {}) };
-    let matchedKey = null;
-    let matchedValue = null;
-
-    for (const [key, val] of Object.entries(allData)) {
-      if (key.toLowerCase().includes(lower) || prettyName(key).toLowerCase().includes(lower)) {
-        matchedKey = key;
-        matchedValue = typeof val === 'object' ? val.value : val;
-        break;
-      }
-    }
-
-    // Fuzzy fallback
-    if (!matchedKey) {
-      for (const [key, val] of Object.entries(allData)) {
-        const kw = key.toLowerCase().replace(/[_-]/g, ' ');
-        if (lower.split(/\s+/).some((w) => kw.includes(w))) {
-          matchedKey = key;
-          matchedValue = typeof val === 'object' ? val.value : val;
-          break;
-        }
-      }
-    }
-
-    if (!matchedKey || !matchedValue) {
-      const available = Object.entries(allData)
-        .filter(([, v]) => v)
-        .map(([k, v]) => {
-          const val = typeof v === 'object' ? v.value : v;
-          return `• <b>${prettyName(k)}</b>: ${val}`;
-        }).join('<br>');
-
-      addMessage(
-        `🤔 I don't have a value for "<b>${fieldText}</b>".<br><br>` +
-        (available ? `Here's what I have:<br>${available}<br><br>Try: <i>"spell name"</i>` : 'No fields have been filled yet.'),
-        'bot', '', true
-      );
-      return;
-    }
-
-    addMessage(`🔤 Spelling <b>${prettyName(matchedKey)}</b>: <b>${matchedValue}</b>`, 'bot', '', true);
-    await spellAloud(prettyName(matchedKey), matchedValue);
-  }
-
-  // ============================================================
-  // ACTUALLY FILL THE FORM (called after confirmation)
-  // ============================================================
-
-  async function doActualFill(payload) {
-    const fieldsToFill = payload.fields_to_fill || {};
-    const summary = payload.summary || {};
-    const fieldCount = Object.keys(fieldsToFill).length;
-
-    if (fieldCount === 0) {
+  async function executeFill(fieldsToFill, summary) {
+    if (!fieldsToFill || Object.keys(fieldsToFill).length === 0) {
       addMessage("⚠️ Nothing to fill.", 'bot', '', true);
       return;
     }
 
     setStatus('🔄 Filling form…');
 
-    const fillResult = await chrome.runtime.sendMessage({
+    let fillResult;
+    fillResult = await safeSendMessage({
       type: 'EXECUTE_CHAT_FILL',
       fieldsToFill,
       summary,
       tabId: 'current',
     });
+    if (!fillResult) {
+      addMessage('⚠️ Could not communicate with the extension. Please reload the page and try again.', 'bot', '', true);
+      setStatus('Connection error', 'error');
+      return;
+    }
 
-    // Update tracking
+    // Update local tracking
     for (const [key, data] of Object.entries(fieldsToFill)) {
       const val = typeof data === 'object' ? data.value : data;
       if (val) filledFields[key] = val;
     }
-
-    // Build summary
-    const filledList = Object.entries(summary)
-      .filter(([, v]) => v)
-      .map(([k, v]) => `<div class="ws-summary-row"><span class="label">${prettyName(k)}</span><span class="value">${v}</span></div>`)
-      .join('');
-
-    addMessage(
-      `✅ Filled <b>${fieldCount}</b> field${fieldCount > 1 ? 's' : ''}!` +
-      (filledList ? `<div class="ws-summary">${filledList}</div>` : ''),
-      'bot', '', true
-    );
 
     // Show remaining unfilled fields
     const visibleFields = detectedFields.filter((f) => f.isVisible);
@@ -1512,32 +1500,28 @@
         'bot', '', false
       );
     } else {
-      addMessage('🎉 <b>All fields filled!</b> Review the form and submit when ready.' + buildFieldChips(visibleFields), 'bot', '', true);
-      setStatus('All fields filled ✓', 'success');
+      // SRS: "Form successfully filled."
+      addMessage(
+        '🎉 <b>Form successfully filled!</b>' +
+        buildFieldChips(visibleFields),
+        'bot', '', true
+      );
+      setStatus('Form successfully filled ✓', 'success');
+
+      // SRS: "Would you like to save these details for future forms?"
+      addMessage(
+        '💾 <b>Would you like to save these details for future forms?</b><br><br>' +
+        'Say <b>"yes"</b> to securely store in encrypted local storage, or <b>"no"</b> to use temporarily (cleared after submit/tab close).',
+        'bot', '', true
+      );
+      awaitingSaveDecision = true;
     }
 
-    // Notify about not-found fields
+    // Warn about not-found fields
     if (fillResult && fillResult.notFound && fillResult.notFound.length > 0) {
       const missed = fillResult.notFound.map((f) => prettyName(f.fieldName)).join(', ');
       addMessage(`⚠️ Could not locate on page: <b>${missed}</b>. These may need manual entry.`, 'bot', '', true);
     }
-
-    conversationState = STATE_IDLE;
-  }
-
-  function showPartialFill(partial) {
-    const entries = Object.entries(partial).filter(([, v]) => {
-      const val = typeof v === 'object' ? v.value : v;
-      return val;
-    });
-    if (entries.length === 0) return;
-
-    const rows = entries.map(([k, v]) => {
-      const val = typeof v === 'object' ? v.value : v;
-      return `<div class="ws-summary-row"><span class="label">${prettyName(k)}</span><span class="value">${val}</span></div>`;
-    }).join('');
-
-    addMessage(`📋 So far I've captured:<div class="ws-summary">${rows}</div>`, 'bot', '', false);
   }
 
   // ============================================================
@@ -1556,11 +1540,14 @@
     sessionId = `ws_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     filledFields = {};
     hasGreeted = false;
-    conversationState = STATE_IDLE;
-    pendingPayload = null;
-    correctingField = null;
-    spellingValue = '';
-    lastPartialData = null;
+    savedProfile = null;
+    savedProfilePendingDecision = false;
+    awaitingSaveDecision = false;
+    tempDataOnly = false;
+    fieldByFieldMode = false;
+    essentialFields = [];
+    currentFieldIndex = -1;
+    awaitingFieldInput = false;
     synth.cancel();
     doFormScan();
     hasGreeted = true;
@@ -1622,6 +1609,10 @@
     const fields = deepScanFields();
     if (fields.length > 0) {
       updateFabBadge(fields.length);
+      // SRS: Auto-open panel when a signup/booking form is detected (3+ fields)
+      if (fields.length >= 3 && !panelOpen) {
+        openPanel();
+      }
     }
   }, 1500);
 

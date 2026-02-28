@@ -3,12 +3,12 @@ Test suite for LangGraph form-filling chain.
 
 Tests:
   - State schema validation
-  - Individual node functions (intake, extract, match, confirm, correction, output)
+  - Individual node functions (intake, router, review, fill)
   - Sensitive data detection / redaction
-  - Graph routing logic
-  - End-to-end invoke_form_filling()
+  - Graph routing logic (route_decision, confirm_decision, correction_decision)
+  - Helper functions (normalize, fields_match, parse_llm_json)
 
-Requires: pytest, langgraph, langchain-openai
+Requires: pytest, langgraph, langchain-cohere
 Run:  pytest backend/nlp/test_form_filling.py -v
 """
 
@@ -19,16 +19,25 @@ import pytest
 # ── Add chains package to path ──
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from chains.state import WebSenseState, FieldData
+from chains.state import WebSenseState, FieldData, BotResponse
 from chains.nodes import (
     intake_node,
+    router_node,
+    review_node,
+    fill_node,
+    confirm_handler_node,
+    correction_handler_node,
+    spell_readout_node,
+    _build_label_map,
+    _is_yes,
+    _is_no,
     SENSITIVE_PATTERNS,
     _normalize_field_name,
     _fields_match,
     _parse_llm_json,
     CORRECTION_KEYWORDS,
 )
-from chains.graph import route_after_confirm
+from chains.graph import route_decision, confirm_decision, correction_decision
 
 
 # ================================================================
@@ -213,43 +222,237 @@ class TestFieldsMatch:
 
 
 # ================================================================
-# Graph Routing Tests
+# Graph Routing Tests (new router-based architecture)
 # ================================================================
 class TestGraphRouting:
 
-    def test_routes_to_correction_when_correction_mode(self):
-        state: WebSenseState = {
-            'correction_mode': True,
-            'needs_clarification': False,
-            'ready_to_fill': False,
-        }
-        assert route_after_confirm(state) == 'correction'
+    def test_route_decision_reads_next_route(self):
+        state: WebSenseState = {'next_route': 'confirm'}
+        assert route_decision(state) == 'confirm'
 
-    def test_routes_to_end_when_needs_clarification(self):
-        state: WebSenseState = {
-            'correction_mode': False,
-            'needs_clarification': True,
-            'ready_to_fill': False,
-        }
-        result = route_after_confirm(state)
-        assert result == '__end__'
+    def test_route_decision_defaults_to_extract(self):
+        state: WebSenseState = {}
+        assert route_decision(state) == 'extract'
 
-    def test_routes_to_output_when_ready(self):
-        state: WebSenseState = {
-            'correction_mode': False,
-            'needs_clarification': False,
-            'ready_to_fill': True,
-        }
-        assert route_after_confirm(state) == 'output'
+    def test_confirm_decision_fill(self):
+        state: WebSenseState = {'confirm_route': 'fill'}
+        assert confirm_decision(state) == 'fill'
 
-    def test_routes_to_end_by_default(self):
+    def test_confirm_decision_end(self):
+        state: WebSenseState = {'confirm_route': 'end'}
+        assert confirm_decision(state) == 'end'
+
+    def test_confirm_decision_defaults_end(self):
+        state: WebSenseState = {}
+        assert confirm_decision(state) == 'end'
+
+    def test_correction_decision_review(self):
+        state: WebSenseState = {'correction_route': 'review'}
+        assert correction_decision(state) == 'review'
+
+    def test_correction_decision_end(self):
+        state: WebSenseState = {'correction_route': 'end'}
+        assert correction_decision(state) == 'end'
+
+    def test_correction_decision_defaults_end(self):
+        state: WebSenseState = {}
+        assert correction_decision(state) == 'end'
+
+
+# ================================================================
+# Router Node Tests
+# ================================================================
+class TestRouterNode:
+
+    def test_idle_routes_to_extract(self):
         state: WebSenseState = {
-            'correction_mode': False,
-            'needs_clarification': False,
-            'ready_to_fill': False,
+            'conversation_phase': 'idle',
+            'raw_transcript': 'my name is ahmed',
         }
-        result = route_after_confirm(state)
-        assert result == '__end__'
+        result = router_node(state)
+        assert result['next_route'] == 'extract'
+
+    def test_confirming_yes_routes_to_confirm(self):
+        state: WebSenseState = {
+            'conversation_phase': 'confirming',
+            'raw_transcript': 'yes',
+        }
+        result = router_node(state)
+        assert result['next_route'] == 'confirm'
+
+    def test_confirming_no_routes_to_confirm(self):
+        state: WebSenseState = {
+            'conversation_phase': 'confirming',
+            'raw_transcript': 'no',
+        }
+        result = router_node(state)
+        assert result['next_route'] == 'confirm'
+
+    def test_confirming_new_input_routes_to_extract(self):
+        state: WebSenseState = {
+            'conversation_phase': 'confirming',
+            'raw_transcript': 'my email is test@test.com',
+        }
+        result = router_node(state)
+        assert result['next_route'] == 'extract'
+
+    def test_correcting_routes_to_correction(self):
+        state: WebSenseState = {
+            'conversation_phase': 'correcting',
+            'raw_transcript': 'name is wrong',
+        }
+        result = router_node(state)
+        assert result['next_route'] == 'correction'
+
+    def test_spelling_routes_to_correction(self):
+        state: WebSenseState = {
+            'conversation_phase': 'spelling',
+            'raw_transcript': 'a h m e d',
+        }
+        result = router_node(state)
+        assert result['next_route'] == 'correction'
+
+    def test_spell_confirm_routes_to_correction(self):
+        state: WebSenseState = {
+            'conversation_phase': 'spell_confirm',
+            'raw_transcript': 'yes',
+        }
+        result = router_node(state)
+        assert result['next_route'] == 'correction'
+
+    def test_idle_spell_command_routes_to_spell(self):
+        state: WebSenseState = {
+            'conversation_phase': 'idle',
+            'raw_transcript': 'spell name',
+        }
+        result = router_node(state)
+        assert result['next_route'] == 'spell_command'
+
+
+# ================================================================
+# Yes/No Detection Tests
+# ================================================================
+class TestYesNoDetection:
+
+    def test_is_yes_basic(self):
+        assert _is_yes('yes') is True
+        assert _is_yes('Yeah') is True
+        assert _is_yes('ok') is True
+        assert _is_yes('sure') is True
+        assert _is_yes('go ahead') is True
+
+    def test_is_no_basic(self):
+        assert _is_no('no') is True
+        assert _is_no('wrong') is True
+        assert _is_no('fix') is True
+        assert _is_no('nope') is True
+
+    def test_is_yes_rejects_no(self):
+        assert _is_yes('no') is False
+        assert _is_yes('wrong') is False
+
+    def test_is_no_rejects_yes(self):
+        assert _is_no('yes') is False
+        assert _is_no('ok') is False
+
+
+# ================================================================
+# Review Node Tests
+# ================================================================
+class TestReviewNode:
+
+    def test_builds_confirmation_with_fields(self):
+        state: WebSenseState = {
+            'extracted_fields': {
+                'firstName': {'value': 'Ahmed', 'confidence': 0.95},
+                'email': {'value': 'test@test.com', 'confidence': 0.9},
+            },
+            'confidence_scores': {},
+            'missing_fields': [],
+            'page_fields': [
+                {'id': 'firstName', 'name': 'firstName', 'label': 'First Name'},
+                {'id': 'email', 'name': 'email', 'label': 'Email'},
+            ],
+        }
+        result = review_node(state)
+        assert result['conversation_phase'] == 'confirming'
+        assert result['bot_response']['action'] == 'confirm_fill'
+        assert 'Ahmed' in result['bot_response']['message']
+
+    def test_no_fields_returns_show_fields(self):
+        state: WebSenseState = {
+            'extracted_fields': {},
+            'confidence_scores': {},
+            'missing_fields': [],
+            'page_fields': [],
+        }
+        result = review_node(state)
+        assert result['conversation_phase'] == 'idle'
+        assert result['bot_response']['action'] == 'show_fields'
+
+
+# ================================================================
+# Confirm Handler Tests
+# ================================================================
+class TestConfirmHandler:
+
+    def test_yes_routes_to_fill(self):
+        state: WebSenseState = {
+            'raw_transcript': 'yes',
+            'extracted_fields': {'name': {'value': 'Ahmed'}},
+            'page_fields': [],
+        }
+        result = confirm_handler_node(state)
+        assert result['confirm_route'] == 'fill'
+
+    def test_no_enters_correction_mode(self):
+        state: WebSenseState = {
+            'raw_transcript': 'no',
+            'extracted_fields': {'name': {'value': 'Ahmed'}},
+            'page_fields': [],
+        }
+        result = confirm_handler_node(state)
+        assert result['conversation_phase'] == 'correcting'
+        assert result['confirm_route'] == 'end'
+        assert result['bot_response']['action'] == 'ask_correction'
+
+
+# ================================================================
+# Fill Node Tests
+# ================================================================
+class TestFillNode:
+
+    def test_builds_fill_payload(self):
+        state: WebSenseState = {
+            'extracted_fields': {
+                'firstName': {'value': 'Ahmed', 'confidence': 0.95},
+            },
+            'matched_selectors': {'firstName': ['#firstName']},
+            'confidence_scores': {'firstName': 0.95},
+            'page_fields': [{'id': 'firstName', 'name': 'firstName', 'label': 'First Name'}],
+            'session_id': 'test_sess',
+        }
+        result = fill_node(state)
+        assert result['conversation_phase'] == 'idle'
+        assert result['bot_response']['action'] == 'execute_fill'
+        assert 'firstName' in result['bot_response']['fields_to_fill']
+        assert result['bot_response']['fields_to_fill']['firstName']['value'] == 'Ahmed'
+
+
+# ================================================================
+# Label Map Helper Tests
+# ================================================================
+class TestBuildLabelMap:
+
+    def test_builds_map_from_page_fields(self):
+        fields = [
+            {'id': 'firstName', 'name': 'first_name', 'label': 'First Name'},
+            {'id': 'email', 'name': 'email', 'placeholder': 'Your email'},
+        ]
+        label_map = _build_label_map(fields)
+        assert label_map.get('firstName') == 'First Name'
+        assert label_map.get('first_name') == 'First Name'
+        assert label_map.get('email') == 'Your email'
 
 
 # ================================================================

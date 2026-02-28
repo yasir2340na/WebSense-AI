@@ -66,8 +66,11 @@ export default function useVoiceFormFill() {
     if (typeof chrome !== 'undefined' && chrome.tabs) {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (tabs[0]?.url) {
-          const isHttp = tabs[0].url.startsWith('http://');
-          setIsHttpPage(isHttp);
+          const url = tabs[0].url;
+          const isHttp = url.startsWith('http://');
+          // Allow localhost/127.0.0.1 for development testing
+          const isLocalhost = url.includes('localhost') || url.includes('127.0.0.1');
+          setIsHttpPage(isHttp && !isLocalhost);
         }
       });
     }
@@ -242,9 +245,48 @@ export default function useVoiceFormFill() {
         return;
       }
 
-      // Handle different response statuses
-      if (response.status === 'ready' && response.payload) {
-        // Send fill command to content script via background
+      // Handle BotResponse format from backend (action-based)
+      const action = response.action;
+
+      if (action === 'execute_fill' && response.fields_to_fill) {
+        // Backend returned ready-to-fill payload
+        const fillResponse = await new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage(
+            {
+              type: 'EXECUTE_CHAT_FILL',
+              fieldsToFill: response.fields_to_fill,
+              summary: response.summary || response.fields_summary || {},
+            },
+            (resp) => {
+              if (chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+              } else {
+                resolve(resp);
+              }
+            }
+          );
+        });
+
+        setFilledSummary(response.summary || response.fields_summary || {});
+        setFillReport(fillResponse || null);
+        setListeningState('filled');
+      } else if (action === 'confirm_fill' || action === 'show_fields') {
+        // Need user confirmation — show the message as clarification
+        setClarificationQuestion(
+          response.message?.replace(/<[^>]*>/g, '') || 'Should I fill these fields?'
+        );
+        setPartialFields(response.fields_summary || null);
+        setListeningState('confirming');
+      } else if (action === 'ask_correction' || action === 'ask_spelling' || action === 'confirm_spelling') {
+        setClarificationQuestion(
+          response.message?.replace(/<[^>]*>/g, '') || 'What would you like to correct?'
+        );
+        setListeningState('confirming');
+      } else if (action === 'error') {
+        setErrorMessage(response.message || 'Something went wrong.');
+        setListeningState('error');
+      } else if (response.status === 'ready' && response.payload) {
+        // Legacy format support
         const fillResponse = await new Promise((resolve, reject) => {
           chrome.runtime.sendMessage(
             {
@@ -270,6 +312,7 @@ export default function useVoiceFormFill() {
         setPartialFields(response.partial || null);
         setListeningState('confirming');
       } else {
+        // Unknown response — try to show message
         setErrorMessage(response.message || 'Unexpected response from AI service.');
         setListeningState('error');
       }

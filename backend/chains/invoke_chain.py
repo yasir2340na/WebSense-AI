@@ -21,9 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from chains.graph import invoke_form_filling
 except ImportError as e:
-    # Fallback error response if imports fail
     error_response = {
-        "status": "error",
+        "action": "error",
         "message": f"Failed to import chain modules: {str(e)}",
     }
     print(json.dumps(error_response))
@@ -39,7 +38,7 @@ def main() -> None:
         # Read JSON payload from command-line argument
         if len(sys.argv) < 2:
             error_response = {
-                "status": "error",
+                "action": "error",
                 "message": "Missing JSON payload argument",
             }
             print(json.dumps(error_response))
@@ -53,26 +52,24 @@ def main() -> None:
         page_fields = payload.get("page_fields", [])
         session_id = payload.get("session_id", "")
         user_id = payload.get("user_id", "default_user")
-        user_response = payload.get("user_response", "")
-        correction_mode = payload.get("correction_mode", False)
+        resume_state = payload.get("resume_state", {})
 
         # Validate required fields
         if not transcript or not session_id:
             error_response = {
-                "status": "error",
+                "action": "error",
                 "message": "Missing required fields: transcript and session_id",
             }
             print(json.dumps(error_response))
             sys.exit(1)
 
-        # Invoke the LangGraph chain
+        # Invoke the LangGraph chain — returns a BotResponse dict
         result = invoke_form_filling(
             transcript=transcript,
             page_fields=page_fields,
             session_id=session_id,
             user_id=user_id,
-            user_response=user_response,
-            correction_mode=correction_mode,
+            resume_state=resume_state,
         )
 
         # Output result as JSON to stdout
@@ -81,7 +78,7 @@ def main() -> None:
 
     except json.JSONDecodeError as e:
         error_response = {
-            "status": "error",
+            "action": "error",
             "message": f"Invalid JSON payload: {str(e)}",
         }
         print(json.dumps(error_response))
@@ -89,7 +86,7 @@ def main() -> None:
 
     except Exception as e:
         error_response = {
-            "status": "error",
+            "action": "error",
             "message": f"Chain execution failed: {str(e)}",
         }
         print(json.dumps(error_response))

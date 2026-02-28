@@ -15,6 +15,7 @@
 const express = require('express');
 const router = express.Router();
 const { spawn } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 
 const {
@@ -29,14 +30,17 @@ const logger = require('../utils/secureLogger');
 // CONFIGURATION
 // ============================================================
 
-const PYTHON_EXECUTABLE = process.env.PYTHON_PATH || 'python';
+const VENV_PYTHON_PATH = path.join(__dirname, '..', 'nlp', 'venv', 'Scripts', 'python.exe');
+const PYTHON_EXECUTABLE = process.env.PYTHON_PATH || (fs.existsSync(VENV_PYTHON_PATH) ? VENV_PYTHON_PATH : 'python');
 const CHAIN_SCRIPT_PATH = path.join(__dirname, '..', 'chains', 'invoke_chain.py');
-const REQUEST_TIMEOUT = 10000; // 10 seconds
+const REQUEST_TIMEOUT = 30000; // 30 seconds
 const RATE_LIMIT_WINDOW = 60000; // 1 minute
 const RATE_LIMIT_MAX = 30; // 30 requests per minute per session
 
 // In-memory rate limiting tracker (use Redis in production)
 const rateLimitStore = new Map();
+// In-memory conversation state tracker for spawned Python processes
+const sessionStateStore = new Map();
 
 // ============================================================
 // MIDDLEWARE
@@ -225,27 +229,31 @@ setInterval(cleanupRateLimitStore, 5 * 60 * 1000);
 /**
  * POST /api/form-fill
  * 
- * Main endpoint for form filling. Handles initial input and
- * multi-turn clarification responses.
+ * Unified endpoint for all form-filling conversation turns.
+ * The Python LangGraph router decides what to do based on the
+ * persisted conversation_phase (idle → extract, confirming → confirm handler,
+ * correcting/spelling → correction handler, etc.).
  * 
  * Request Body:
- *   - transcript: string (user's voice input)
+ *   - transcript: string (user's voice/text input)
  *   - pageFields: array (form field metadata from DOM)
  *   - sessionId: string (unique session identifier)
- *   - userId: string (optional, user identifier)
+ *   - userId: string (optional)
  * 
- * Response:
- *   - status: "ready" | "needs_input" | "error"
- *   - payload: object (when ready)
- *   - question: string (when needs_input)
- *   - partial: object (partial extraction when needs_input)
+ * Response (BotResponse):
+ *   - action: string ("confirm_fill"|"execute_fill"|"ask_correction"|"ask_spelling"|"confirm_spelling"|"spell_readout"|"show_fields"|"error")
+ *   - message: string (HTML bot message)
+ *   - fields_summary: object (pretty-name → value)
+ *   - fields_to_fill: object (only when action="execute_fill")
+ *   - speak_text: string (for TTS)
+ *   - status_text: string (panel status bar)
+ *   … and other optional fields
  */
 router.post('/form-fill', httpsOnly, authenticate, rateLimit, async (req, res) => {
   const startTime = Date.now();
   logger.logRequest(req, 'form-fill');
 
   try {
-    // Validate required fields
     const validation = validateRequiredFields(req.body, [
       'transcript',
       'pageFields',
@@ -257,24 +265,21 @@ router.post('/form-fill', httpsOnly, authenticate, rateLimit, async (req, res) =
         missing: validation.missing,
       });
       return res.status(400).json({
-        success: false,
-        error: 'Missing required fields',
-        missing: validation.missing,
+        action: 'error',
+        message: 'Missing required fields: ' + validation.missing.join(', '),
       });
     }
 
     const { transcript, pageFields, sessionId, userId = 'default_user' } = req.body;
 
-    // Validate transcript is not empty
     if (!transcript.trim()) {
       return res.status(400).json({
-        success: false,
-        error: 'Empty transcript',
+        action: 'error',
         message: 'Transcript cannot be empty',
       });
     }
 
-    // Security: Filter out password/card fields (double layer)
+    // Security: Filter out password/card fields
     const safePageFields = filterSensitiveFields(pageFields);
 
     logger.info('Form fill request received', {
@@ -282,55 +287,31 @@ router.post('/form-fill', httpsOnly, authenticate, rateLimit, async (req, res) =
       fieldCount: safePageFields.length,
     });
 
-    // Call Python LangGraph chain
+    // Call Python LangGraph chain — returns a BotResponse
     const chainPayload = {
       transcript,
       page_fields: safePageFields,
       session_id: sessionId,
       user_id: userId,
-      correction_mode: false,
+      resume_state: sessionStateStore.get(sessionId) || {},
     };
 
-    const result = await invokePythonChain(chainPayload);
+    const chainResult = await invokePythonChain(chainPayload);
+    const botResponse = chainResult?.bot_response || chainResult;
 
-    // Handle different response statuses
-    if (result.status === 'success') {
-      logger.info('Form fill ready', { sessionId });
-      const duration = Date.now() - startTime;
-      logger.logResponse('form-fill', 200, duration);
-
-      return res.json({
-        status: 'ready',
-        payload: result.payload,
-      });
+    if (chainResult?.state_snapshot) {
+      sessionStateStore.set(sessionId, chainResult.state_snapshot);
     }
 
-    if (result.status === 'needs_input') {
-      logger.info('Form fill needs clarification', { sessionId });
-      const duration = Date.now() - startTime;
-      logger.logResponse('form-fill', 200, duration);
-
-      return res.json({
-        status: 'needs_input',
-        question: result.question,
-        partial: result.partial || {},
-        missing: result.missing || [],
-      });
-    }
-
-    // Error from chain
-    logger.error('Form fill chain error', {
-      sessionId,
-      message: result.message,
-    });
     const duration = Date.now() - startTime;
-    logger.logResponse('form-fill', 500, duration);
+    logger.logResponse('form-fill', 200, duration);
 
-    return res.status(500).json({
-      success: false,
-      error: 'Form filling failed',
-      message: 'Form filling service is temporarily unavailable',
+    logger.info('Form fill response', {
+      sessionId,
+      action: botResponse.action,
     });
+
+    return res.json(botResponse);
 
   } catch (error) {
     logger.error('Form fill request failed', {
@@ -341,8 +322,7 @@ router.post('/form-fill', httpsOnly, authenticate, rateLimit, async (req, res) =
     logger.logResponse('form-fill', 500, duration);
 
     return res.status(500).json({
-      success: false,
-      error: 'Internal server error',
+      action: 'error',
       message: 'Form filling service is temporarily unavailable',
     });
   }
@@ -351,96 +331,45 @@ router.post('/form-fill', httpsOnly, authenticate, rateLimit, async (req, res) =
 /**
  * POST /api/form-fill/correction
  * 
- * Handles user corrections to previously filled fields.
- * Resumes existing LangGraph thread using session_id.
- * 
- * Request Body:
- *   - sessionId: string
- *   - correctionTranscript: string
- *   - pageFields: array (same fields as original request)
- * 
- * Response: Same format as POST /api/form-fill
+ * Legacy alias — now handled by the same router-based chain.
+ * Forwards to the same logic as POST /api/form-fill since the
+ * LangGraph router uses persisted conversation_phase to decide routing.
  */
 router.post('/form-fill/correction', httpsOnly, authenticate, rateLimit, async (req, res) => {
   const startTime = Date.now();
   logger.logRequest(req, 'form-fill-correction');
 
   try {
-    const validation = validateRequiredFields(req.body, [
-      'sessionId',
-      'correctionTranscript',
-      'pageFields',
-    ]);
-
-    if (!validation.valid) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields',
-        missing: validation.missing,
-      });
-    }
-
     const { sessionId, correctionTranscript, pageFields, userId = 'default_user' } = req.body;
 
-    if (!correctionTranscript.trim()) {
+    if (!sessionId || !correctionTranscript) {
       return res.status(400).json({
-        success: false,
-        error: 'Empty correction',
-        message: 'Correction transcript cannot be empty',
+        action: 'error',
+        message: 'Missing sessionId or correctionTranscript',
       });
     }
 
-    const safePageFields = filterSensitiveFields(pageFields);
+    const safePageFields = filterSensitiveFields(pageFields || []);
 
-    logger.info('Correction request received', { sessionId });
-
-    // Call Python chain with correction_mode = true
     const chainPayload = {
       transcript: correctionTranscript,
       page_fields: safePageFields,
       session_id: sessionId,
       user_id: userId,
-      correction_mode: true,
-      user_response: correctionTranscript,
+      resume_state: sessionStateStore.get(sessionId) || {},
     };
 
-    const result = await invokePythonChain(chainPayload);
+    const chainResult = await invokePythonChain(chainPayload);
+    const botResponse = chainResult?.bot_response || chainResult;
 
-    if (result.status === 'success') {
-      logger.info('Correction applied successfully', { sessionId });
-      const duration = Date.now() - startTime;
-      logger.logResponse('form-fill-correction', 200, duration);
-
-      return res.json({
-        status: 'ready',
-        payload: result.payload,
-      });
+    if (chainResult?.state_snapshot) {
+      sessionStateStore.set(sessionId, chainResult.state_snapshot);
     }
 
-    if (result.status === 'needs_input') {
-      const duration = Date.now() - startTime;
-      logger.logResponse('form-fill-correction', 200, duration);
-
-      return res.json({
-        status: 'needs_input',
-        question: result.question,
-        partial: result.partial || {},
-      });
-    }
-
-    // Error
-    logger.error('Correction failed', {
-      sessionId,
-      message: result.message,
-    });
     const duration = Date.now() - startTime;
-    logger.logResponse('form-fill-correction', 500, duration);
+    logger.logResponse('form-fill-correction', 200, duration);
 
-    return res.status(500).json({
-      success: false,
-      error: 'Correction failed',
-      message: 'Could not process correction',
-    });
+    return res.json(botResponse);
 
   } catch (error) {
     logger.error('Correction request failed', {
@@ -450,9 +379,8 @@ router.post('/form-fill/correction', httpsOnly, authenticate, rateLimit, async (
     logger.logResponse('form-fill-correction', 500, duration);
 
     return res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-      message: 'Correction service is temporarily unavailable',
+      action: 'error',
+      message: 'Form filling service is temporarily unavailable',
     });
   }
 });
@@ -482,6 +410,7 @@ router.delete('/form-fill/session/:sessionId', httpsOnly, authenticate, async (r
 
     // Clear rate limit store for this session
     rateLimitStore.delete(sessionId);
+    sessionStateStore.delete(sessionId);
 
     // Note: MemorySaver clears automatically on process restart.
     // For production, implement persistent storage (SqliteSaver)

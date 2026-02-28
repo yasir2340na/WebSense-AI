@@ -168,6 +168,113 @@ function fillFormFields(fieldsPayload) {
   const filled = [];
   const notFound = [];
 
+  const querySelectorEverywhere = (selector) => {
+    if (!selector) return null;
+
+    try {
+      const direct = document.querySelector(selector);
+      if (direct) return direct;
+    } catch {
+      // invalid selector for this context
+    }
+
+    // Same-origin iframe lookup
+    const iframes = document.querySelectorAll('iframe');
+    for (const iframe of iframes) {
+      try {
+        const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+        if (!iframeDoc) continue;
+        const el = iframeDoc.querySelector(selector);
+        if (el) return el;
+      } catch {
+        // Cross-origin iframe; skip
+      }
+    }
+
+    // Open shadow root lookup
+    const allElements = document.querySelectorAll('*');
+    for (const node of allElements) {
+      const shadowRoot = node.shadowRoot;
+      if (!shadowRoot) continue;
+      try {
+        const el = shadowRoot.querySelector(selector);
+        if (el) return el;
+      } catch {
+        // invalid selector in shadow root
+      }
+    }
+
+    return null;
+  };
+
+  const normalizeToken = (value) =>
+    String(value || '')
+      .toLowerCase()
+      .replace(/([a-z])([A-Z])/g, '$1_$2')
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '');
+
+  const findByFieldNameFallback = (fieldName) => {
+    const normalizedField = normalizeToken(fieldName);
+    if (!normalizedField) return null;
+
+    const candidates = [];
+    const pushInputsFromRoot = (root) => {
+      try {
+        root.querySelectorAll('input, select, textarea, [role="textbox"], [role="combobox"]').forEach((el) => {
+          candidates.push(el);
+        });
+      } catch {
+        // ignore root query errors
+      }
+    };
+
+    pushInputsFromRoot(document);
+
+    document.querySelectorAll('iframe').forEach((iframe) => {
+      try {
+        const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+        if (iframeDoc) pushInputsFromRoot(iframeDoc);
+      } catch {
+        // cross-origin
+      }
+    });
+
+    document.querySelectorAll('*').forEach((node) => {
+      if (node.shadowRoot) pushInputsFromRoot(node.shadowRoot);
+    });
+
+    for (const el of candidates) {
+      const id = normalizeToken(el.id || '');
+      const name = normalizeToken(el.getAttribute('name') || '');
+      const placeholder = normalizeToken(el.getAttribute('placeholder') || '');
+      const ariaLabel = normalizeToken(el.getAttribute('aria-label') || '');
+      const auto = normalizeToken(el.getAttribute('autocomplete') || '');
+
+      let label = '';
+      if (el.id) {
+        try {
+          const rootDoc = el.ownerDocument || document;
+          const lbl = rootDoc.querySelector(`label[for="${el.id}"]`);
+          if (lbl) label = lbl.textContent || '';
+        } catch {
+          // ignore
+        }
+      }
+      if (!label && el.closest && el.closest('label')) {
+        label = el.closest('label').textContent || '';
+      }
+      const labelNorm = normalizeToken(label);
+
+      const values = [id, name, placeholder, ariaLabel, auto, labelNorm].filter(Boolean);
+      if (values.some((v) => v.includes(normalizedField) || normalizedField.includes(v))) {
+        return el;
+      }
+    }
+
+    return null;
+  };
+
   for (const [fieldName, fieldData] of Object.entries(fieldsPayload)) {
     const { value, selectors = [], confidence = 0 } = fieldData;
 
@@ -177,12 +284,13 @@ function fillFormFields(fieldsPayload) {
 
     // Try each selector in priority order
     for (const selector of selectors) {
-      try {
-        element = document.querySelector(selector);
-        if (element) break;
-      } catch {
-        // Invalid selector, continue to next
-      }
+      element = querySelectorEverywhere(selector);
+      if (element) break;
+    }
+
+    // Fallback match by field name semantics when selectors miss
+    if (!element) {
+      element = findByFieldNameFallback(fieldName);
     }
 
     if (element) {
@@ -224,7 +332,7 @@ function fillFormFields(fieldsPayload) {
       filled.push({
         fieldName,
         value,
-        selector: selectors.find((s) => { try { return document.querySelector(s) === element; } catch { return false; } }) || '',
+        selector: selectors.find((s) => { try { return querySelectorEverywhere(s) === element; } catch { return false; } }) || '',
         confidence,
       });
     } else {
@@ -280,6 +388,29 @@ function addFillHighlight(element, confidence) {
  * @param {Array} notFoundList - Array of { fieldName, selectors } objects.
  */
 function highlightUnrecognizedFields(notFoundList) {
+  const findEverywhere = (selector) => {
+    if (!selector) return null;
+    try {
+      const direct = document.querySelector(selector);
+      if (direct) return direct;
+    } catch {
+      // ignore invalid
+    }
+
+    const iframes = document.querySelectorAll('iframe');
+    for (const iframe of iframes) {
+      try {
+        const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+        if (!iframeDoc) continue;
+        const el = iframeDoc.querySelector(selector);
+        if (el) return el;
+      } catch {
+        // cross-origin
+      }
+    }
+    return null;
+  };
+
   notFoundList.forEach(({ fieldName }) => {
     // Try to find a field that loosely matches the field name
     const possibleSelectors = [
@@ -289,15 +420,11 @@ function highlightUnrecognizedFields(notFoundList) {
     ];
 
     for (const sel of possibleSelectors) {
-      try {
-        const el = document.querySelector(sel);
-        if (el) {
-          el.style.border = '2px dashed #FF9800';
-          el.title = `Please fill manually: ${fieldName}`;
-          break;
-        }
-      } catch {
-        // Invalid selector, continue
+      const el = findEverywhere(sel);
+      if (el) {
+        el.style.border = '2px dashed #FF9800';
+        el.title = `Please fill manually: ${fieldName}`;
+        break;
       }
     }
   });
@@ -426,7 +553,7 @@ function showFillConfirmationPanel(summary, fillReport) {
       type: 'FILL_CONFIRMED',
       summary,
       fillReport,
-    });
+    }, () => { if (chrome.runtime.lastError) console.warn('WebSense: confirm msg failed'); });
     panel.remove();
   });
 
@@ -435,7 +562,7 @@ function showFillConfirmationPanel(summary, fillReport) {
       type: 'VOICE_CORRECTION',
       correctionTranscript: '',
       sessionId: '',
-    });
+    }, () => { if (chrome.runtime.lastError) console.warn('WebSense: correction msg failed'); });
     panel.innerHTML = '';
     panel.style.cssText += 'padding: 20px; text-align: center;';
     panel.innerHTML = `
@@ -489,7 +616,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       chrome.runtime.sendMessage({
         type: 'PAGE_FIELDS_UPDATED',
         fields: updatedFields,
-      });
+      }, () => { if (chrome.runtime.lastError) { /* Background may not be listening yet */ } });
     });
 
     sendResponse({ fields });

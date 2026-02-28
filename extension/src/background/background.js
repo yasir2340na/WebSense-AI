@@ -84,14 +84,19 @@ const decryptData = async (encryptedPayload) => {
 };
 
 /**
- * Checks whether a page URL uses HTTPS.
- * Form filling is disabled on insecure HTTP pages.
+ * Checks whether a page URL uses HTTPS (or localhost for development).
+ * Form filling is disabled on insecure HTTP pages (except localhost).
  * @param {string} url - The page URL to check.
- * @returns {boolean} True if the page is secure (HTTPS).
+ * @returns {boolean} True if the page is secure (HTTPS or localhost).
  */
 const isPageSecure = (url) => {
   try {
-    return new URL(url).protocol === 'https:';
+    const parsed = new URL(url);
+    // Allow HTTPS always
+    if (parsed.protocol === 'https:') return true;
+    // Allow localhost/127.0.0.1 for development testing
+    if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') return true;
+    return false;
   } catch {
     return false;
   }
@@ -105,7 +110,7 @@ const isPageSecure = (url) => {
  */
 const callFormFillAPI = async (endpoint, body) => {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
 
   try {
     const response = await fetch(`${BACKEND_URL}${endpoint}`, {
@@ -422,13 +427,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!fieldResponse || !fieldResponse.fields || fieldResponse.fields.length === 0) {
           sendResponse({
             success: false,
+            action: 'error',
             error: 'No fillable fields detected on this page',
-            message: 'Try clicking inside a form first.',
+            message: 'No fillable fields detected. Try clicking inside a form first.',
           });
           return;
         }
 
-        // Call backend API
+        // Call backend API — returns BotResponse
         const apiResponse = await callFormFillAPI('/api/form-fill', {
           transcript,
           pageFields: fieldResponse.fields,
@@ -436,11 +442,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           userId: userId || 'default_user',
         });
 
-        sendResponse({ success: true, ...apiResponse });
+        // Pass through the BotResponse with success flag
+        sendResponse({
+          success: apiResponse.action !== 'error',
+          ...apiResponse,
+        });
       } catch (err) {
         console.error('❌ Form fill error:', err.message);
         sendResponse({
           success: false,
+          action: 'error',
           error: 'Form filling unavailable',
           message: 'AI service temporarily unavailable',
         });
@@ -593,14 +604,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
    * CHAT_FORM_FILL
    * Triggered from the sliding chat panel (formChatPanel.js).
    * Receives transcript + already-scanned page fields.
-   * Forwards to /api/form-fill and returns result to chat panel.
+   * Forwards to /api/form-fill and returns the structured BotResponse.
+   * The panel is a thin client — it just renders the response.
    */
   else if (message.type === 'CHAT_FORM_FILL') {
     const { transcript, sessionId, pageFields } = message;
 
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       if (!tabs[0]) {
-        sendResponse({ success: false, error: 'No active tab found' });
+        sendResponse({ action: 'error', message: 'No active tab found' });
         return;
       }
 
@@ -608,8 +620,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       if (!isPageSecure(tab.url) && !tab.url.startsWith('chrome://')) {
         sendResponse({
-          success: false,
-          error: 'Form fill disabled on unsafe pages',
+          action: 'error',
           message: 'Voice form fill is only available on HTTPS pages.',
         });
         return;
@@ -618,32 +629,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         formFillSessions.set(tab.id, sessionId);
 
-        const apiResponse = await callFormFillAPI('/api/form-fill', {
+        // Backend returns a BotResponse directly
+        const botResponse = await callFormFillAPI('/api/form-fill', {
           transcript,
           pageFields: pageFields || [],
           sessionId,
           userId: 'default_user',
         });
 
-        if (apiResponse.status === 'ready' && apiResponse.payload) {
-          sendResponse({ success: true, status: 'ready', payload: apiResponse.payload });
-        } else if (apiResponse.status === 'needs_input') {
+        // If botResponse has an error from fetch itself
+        if (botResponse.status === 'error') {
           sendResponse({
-            success: true,
-            status: 'needs_input',
-            question: apiResponse.question,
-            partial: apiResponse.partial || {},
-            missing: apiResponse.missing || [],
+            action: 'error',
+            message: botResponse.message || 'Backend service temporarily unavailable',
           });
-        } else {
-          sendResponse({ success: false, error: 'Unexpected backend response' });
+          return;
         }
+
+        // Pass through the structured BotResponse as-is
+        // Ensure the response has the expected structure
+        sendResponse({
+          ...botResponse,
+          success: botResponse.action !== 'error',
+        });
       } catch (err) {
         console.error('❌ Chat form fill error:', err.message);
         sendResponse({
-          success: false,
-          error: 'Form filling unavailable',
+          action: 'error',
           message: 'Backend service temporarily unavailable',
+          success: false,
         });
       }
     });

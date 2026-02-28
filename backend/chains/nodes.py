@@ -1,13 +1,19 @@
 """
 WebSense-AI Form Filling Chain — Node Functions
 
-Contains all 6 LangGraph node functions:
-    1. intake_node      — Sanitizes transcript, detects sensitive data
-    2. extract_node     — Uses Cohere (command-a-03-2025) to extract form field values
-    3. match_selectors_node — Maps fields to CSS selectors
-    4. confirm_node     — Reviews confidence, checks completeness
-    5. correction_node  — Handles user corrections to specific fields
-    6. output_node      — Assembles final payload for Chrome extension
+Orchestration-based architecture. The graph uses a router node to inspect
+conversation_phase and route each user turn to the correct handler.
+
+Nodes:
+    1. router_node            — Inspects phase + input, sets next_route
+    2. intake_node            — Sanitizes transcript, detects sensitive data
+    3. extract_node           — Uses Cohere LLM to extract form field values
+    4. match_selectors_node   — Maps fields to CSS selectors
+    5. review_node            — Builds confirmation summary, sets phase="confirming"
+    6. confirm_handler_node   — Handles yes/no during confirmation
+    7. correction_handler_node — Handles correction identification + spelling flows
+    8. fill_node              — Builds final fill payload
+    9. spell_readout_node     — Reads out a filled field value via TTS
 """
 
 import re
@@ -249,12 +255,33 @@ def extract_node(state: WebSenseState) -> dict[str, Any]:
 
     Returns:
         Dict of state updates: extracted_fields, missing_fields,
-        needs_clarification, clarification_question, conversation_history.
+        conversation_history.
     """
     sanitized_transcript: str = state.get("sanitized_transcript", "")
     page_fields: list[dict] = state.get("page_fields", [])
     conversation_history: list[dict] = state.get("conversation_history", [])
     existing_fields: dict = state.get("extracted_fields", {})
+
+    # Fast-path: local regex extraction first to avoid LLM latency on common phrases.
+    # This keeps the chat responsive for inputs like:
+    # "my first name is Yasir", "email is a@b.com", "phone is ...".
+    quick_fields = _regex_fallback_extract(sanitized_transcript)
+    if quick_fields:
+        merged_fields = {**existing_fields, **quick_fields}
+
+        conversation_history = conversation_history.copy()
+        conversation_history.append({
+            "turn": state.get("turn_count", 1),
+            "role": "assistant",
+            "content": f"Fast-extracted: {list(quick_fields.keys())}",
+        })
+
+        return {
+            "extracted_fields": merged_fields,
+            "missing_fields": [f.get("name", "") or f.get("id", "") for f in page_fields if (f.get("name", "") or f.get("id", "")) not in merged_fields],
+            "conversation_history": conversation_history,
+            "error_message": "",
+        }
 
     # Build field context for the LLM — give it full page field details
     # Emphasize the label/meaning to help semantic matching
@@ -315,8 +342,6 @@ def extract_node(state: WebSenseState) -> dict[str, Any]:
 
         extracted = parsed.get("extracted_fields", {})
         missing = parsed.get("missing_fields", [])
-        needs_clarification = parsed.get("needs_clarification", False)
-        clarification_question = parsed.get("clarification_question", "")
 
         # Merge with existing fields (preserve previous turns)
         merged_fields = {**existing_fields, **extracted}
@@ -332,8 +357,6 @@ def extract_node(state: WebSenseState) -> dict[str, Any]:
         return {
             "extracted_fields": merged_fields,
             "missing_fields": missing,
-            "needs_clarification": needs_clarification,
-            "clarification_question": clarification_question,
             "conversation_history": conversation_history,
             "error_message": "",
         }
@@ -346,8 +369,6 @@ def extract_node(state: WebSenseState) -> dict[str, Any]:
         return {
             "extracted_fields": merged_fields,
             "missing_fields": [f.get("name", "") or f.get("id", "") for f in page_fields],
-            "needs_clarification": True,
-            "clarification_question": "I had trouble understanding. Could you repeat your details?",
             "error_message": f"LLM extraction failed: {str(e)}",
         }
 
@@ -435,247 +456,612 @@ def match_selectors_node(state: WebSenseState) -> dict[str, Any]:
 
 
 # ============================================================
-# NODE 4: CONFIRM
+# ORCHESTRATION CONSTANTS
 # ============================================================
 
-def confirm_node(state: WebSenseState) -> dict[str, Any]:
+YES_WORDS = frozenset([
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "correct",
+    "right", "confirm", "go ahead", "fill it", "do it", "proceed",
+    "yes yes", "yes confirm", "yes please", "confirm this",
+])
+
+NO_WORDS = frozenset([
+    "no", "nope", "nah", "wrong", "mistake", "incorrect",
+    "not right", "change", "fix", "wait", "stop",
+])
+
+DONE_WORDS = frozenset([
+    "done", "finished", "that is it", "that's it", "stop", "end", "okay",
+])
+
+CANCEL_WORDS = frozenset([
+    "cancel", "back", "never mind", "nevermind",
+])
+
+
+def _is_yes(text: str) -> bool:
+    lower = text.lower().strip()
+    return lower in YES_WORDS or any(w in lower.split() for w in ("yes", "yeah", "yep", "sure", "ok", "okay", "confirm", "proceed"))
+
+
+def _is_no(text: str) -> bool:
+    lower = text.lower().strip()
+    return lower in NO_WORDS or any(w in lower.split() for w in ("no", "nope", "wrong", "mistake", "fix", "change"))
+
+
+# ============================================================
+# HELPER: Build label map from page_fields
+# ============================================================
+
+def _build_label_map(page_fields: list[dict]) -> dict[str, str]:
+    """Build field-key → human-readable label lookup."""
+    label_map: dict[str, str] = {}
+    for pf in page_fields:
+        fid = pf.get("id", "")
+        fname = pf.get("name", "")
+        label = pf.get("label", "") or pf.get("placeholder", "") or pf.get("ariaLabel", "")
+        if label:
+            label = label.replace("*", "").strip()
+        if fid:
+            label_map[fid] = label or fid
+        if fname:
+            label_map[fname] = label or fname
+    return label_map
+
+
+def _pretty(name: str, label_map: dict[str, str]) -> str:
+    """Return human-readable label for a field name/id."""
+    if name in label_map and label_map[name] != name:
+        return label_map[name]
+    return re.sub(r'[_\-]+', ' ', name).strip().title()
+
+
+def _build_summary_html(extracted_fields: dict, label_map: dict) -> str:
+    """Build HTML summary rows for display in chat."""
+    rows = []
+    for k, v in extracted_fields.items():
+        val = v.get("value", "") if isinstance(v, dict) else v
+        if val:
+            pretty = _pretty(k, label_map)
+            rows.append(f"• <b>{pretty}</b>: {val}")
+    return "<br>".join(rows)
+
+
+# ============================================================
+# NODE 0: ROUTER
+# ============================================================
+
+def router_node(state: WebSenseState) -> dict[str, Any]:
     """
-    Reviews all confidence scores and checks for missing fields.
+    Inspects conversation_phase and user input to determine routing.
+    Sets next_route which the graph's conditional edge reads.
+    """
+    phase = state.get("conversation_phase", "idle")
+    user_input = state.get("raw_transcript", "").strip()
+    lower = user_input.lower()
 
-    Flags fields with confidence < 0.85 as low confidence.
-    If any issues are found, sets needs_clarification = True.
-    Builds a human-readable confirmation summary.
-    Sets ready_to_fill = True ONLY when all fields are confident and complete.
+    # Check for "spell <field>" command (works in any phase)
+    spell_match = re.match(r'^spell\s+(.+)', lower)
+    if spell_match and phase in ("idle", "confirming"):
+        return {"next_route": "spell_command"}
 
-    Args:
-        state: Current graph state with extracted_fields, confidence_scores,
-               missing_fields.
+    if phase == "idle":
+        return {"next_route": "extract"}
 
-    Returns:
-        Dict of state updates: needs_clarification, clarification_question,
-        ready_to_fill, confirmed.
+    elif phase == "confirming":
+        if _is_yes(lower):
+            return {"next_route": "confirm"}
+        elif _is_no(lower):
+            return {"next_route": "confirm"}
+        else:
+            # Treat as new input to extract and merge
+            return {
+                "next_route": "extract",
+                "conversation_phase": "idle",
+            }
+
+    elif phase in ("correcting", "spelling", "spell_confirm"):
+        return {"next_route": "correction"}
+
+    # Fallback
+    return {"next_route": "extract"}
+
+
+# ============================================================
+# NODE 4: REVIEW (replaces old confirm_node)
+# ============================================================
+
+def review_node(state: WebSenseState) -> dict[str, Any]:
+    """
+    Reviews extracted fields after extraction or after applying a correction.
+    Builds a confirmation summary and sets phase="confirming".
+    Always returns bot_response with action="confirm_fill".
     """
     extracted_fields: dict = state.get("extracted_fields", {})
     confidence_scores: dict = state.get("confidence_scores", {})
     missing_fields: list = state.get("missing_fields", [])
     page_fields: list[dict] = state.get("page_fields", [])
-    correction_mode: bool = state.get("correction_mode", False)
 
-    # If correction mode is active, route to correction (handled by graph routing)
-    if correction_mode:
-        return {
-            "needs_clarification": False,
-            "ready_to_fill": False,
-        }
+    label_map = _build_label_map(page_fields)
 
-    # Build field-name → human-readable label lookup from page_fields
-    field_label_map: dict[str, str] = {}
-    for pf in page_fields:
-        fid = pf.get("id", "")
-        fname = pf.get("name", "")
-        label = pf.get("label", "") or pf.get("placeholder", "") or pf.get("ariaLabel", "")
-        if fid:
-            field_label_map[fid] = label or fid
-        if fname:
-            field_label_map[fname] = label or fname
-
-    def _pretty(name: str) -> str:
-        """Return human-readable label for a field name/id."""
-        if name in field_label_map and field_label_map[name] != name:
-            return field_label_map[name]
-        # Fallback: convert underscores/hyphens to spaces
-        return re.sub(r'[_\-]+', ' ', name).strip().title()
-
-    low_confidence_fields: list[str] = []
-    summary_lines: list[str] = []
-
-    # Review each extracted field's confidence
+    # Build pretty summary
+    summary_lines = []
+    summary_dict = {}
     for field_name, field_data in extracted_fields.items():
-        confidence = confidence_scores.get(field_name, field_data.get("confidence", 0.5))
-        value = field_data.get("value", "")
+        value = field_data.get("value", "") if isinstance(field_data, dict) else field_data
+        if value:
+            pretty = _pretty(field_name, label_map)
+            summary_lines.append(f"• <b>{pretty}</b>: {value}")
+            summary_dict[field_name] = value
 
-        if confidence < CONFIDENCE_THRESHOLD:
-            low_confidence_fields.append(field_name)
-            summary_lines.append(f"  ⚠️ {_pretty(field_name)}: \"{value}\" (confidence: {confidence:.0%})")
-        else:
-            summary_lines.append(f"  ✓ {_pretty(field_name)}: \"{value}\" (confidence: {confidence:.0%})")
+    field_count = len(summary_dict)
 
-    # Determine if we need clarification
-    has_issues = bool(low_confidence_fields) or bool(missing_fields)
-
-    clarification_question = ""
-    if has_issues:
-        parts: list[str] = []
-        if low_confidence_fields:
-            pretty_low = [_pretty(f) for f in low_confidence_fields]
-            parts.append(f"I'm not sure about: {', '.join(pretty_low)}")
-        if missing_fields:
-            pretty_missing = [_pretty(f) for f in missing_fields]
-            parts.append(f"Still missing: {', '.join(pretty_missing)}")
-        clarification_question = ". ".join(parts) + ". Could you provide or confirm these?"
-
-    return {
-        "needs_clarification": has_issues,
-        "clarification_question": clarification_question,
-        "ready_to_fill": not has_issues,
-        "confirmed": not has_issues,
-    }
-
-
-# ============================================================
-# NODE 5: CORRECTION
-# ============================================================
-
-def correction_node(state: WebSenseState) -> dict[str, Any]:
-    """
-    Handles user corrections to specific fields.
-    Triggered when correction keywords are detected in user speech.
-
-    Makes a targeted GPT call to identify ONLY the corrected field,
-    updates that single field, and preserves all others unchanged.
-    Routes back to confirm_node after processing.
-
-    Args:
-        state: Current graph state with user_response, extracted_fields.
-
-    Returns:
-        Dict of state updates: extracted_fields (with correction applied),
-        correction_mode (reset to False).
-    """
-    user_response: str = state.get("user_response", "")
-    extracted_fields: dict = state.get("extracted_fields", {})
-    conversation_history: list[dict] = state.get("conversation_history", [])
-
-    if not user_response:
+    if field_count == 0:
         return {
-            "correction_mode": False,
-            "error_message": "No correction input provided.",
+            "conversation_phase": "idle",
+            "bot_response": {
+                "action": "show_fields",
+                "message": "⚠️ I couldn't extract any values. Could you try again with more detail?",
+                "fields_summary": {},
+                "speak_text": "I couldn't extract any values. Could you try again?",
+                "status_text": "No values extracted",
+            },
         }
 
-    # Sanitize the correction input too
-    sanitized_correction = user_response
-    for data_type, pattern in SENSITIVE_PATTERNS.items():
-        sanitized_correction = pattern.sub(f"[{data_type}_REDACTED]", sanitized_correction)
+    summary_html = "<br>".join(summary_lines)
 
-    # Build correction prompt with current field values
-    current_values = {
-        name: data.get("value", "")
-        for name, data in extracted_fields.items()
-    }
+    # Build missing fields info
+    missing_html = ""
+    if missing_fields:
+        pretty_missing = [_pretty(f, label_map) for f in missing_fields]
+        missing_html = f"<br><br>📝 Still need: <b>{', '.join(pretty_missing)}</b>"
 
-    user_message = (
-        f"Current form values: {json.dumps(current_values)}\n\n"
-        f"User's correction: \"{sanitized_correction}\"\n\n"
-        f"Identify which field to correct and the new value."
+    message = (
+        f"📋 Here's what I captured (<b>{field_count}</b> field{'s' if field_count > 1 else ''}):"
+        f"<br><br>{summary_html}"
+        f"{missing_html}"
+        f"<br><br>👉 <b>Should I fill these fields?</b> Say <b>yes</b> to fill, or <b>no</b> to correct."
     )
 
-    try:
-        llm = ChatCohere(model="command-a-03-2025", temperature=0)
-        response = llm.invoke([
-            SystemMessage(content=CORRECTION_SYSTEM_PROMPT),
-            HumanMessage(content=user_message),
-        ])
+    speak = f"I captured {field_count} fields. Should I fill these? Say yes to fill or no to correct."
 
-        parsed = _parse_llm_json(response.content.strip())
+    return {
+        "conversation_phase": "confirming",
+        "bot_response": {
+            "action": "confirm_fill",
+            "message": message,
+            "fields_summary": {_pretty(k, label_map): v for k, v in summary_dict.items()},
+            "summary": summary_dict,
+            "missing_fields": [_pretty(f, label_map) for f in missing_fields],
+            "speak_text": speak,
+            "status_text": "Waiting for confirmation…",
+        },
+    }
 
-        corrected_field = parsed.get("corrected_field")
-        new_value = parsed.get("new_value")
-        confidence = parsed.get("confidence", 0.9)
 
-        if corrected_field and new_value and corrected_field in extracted_fields:
-            # Update ONLY the corrected field
-            updated_fields = {**extracted_fields}
-            updated_fields[corrected_field] = {
-                **updated_fields[corrected_field],
-                "value": new_value,
-                "confidence": confidence,
-                "source_text": sanitized_correction,
+# ============================================================
+# NODE 5: CONFIRM HANDLER
+# ============================================================
+
+def confirm_handler_node(state: WebSenseState) -> dict[str, Any]:
+    """
+    Handles user response during the "confirming" phase.
+    - Yes → route to fill_node
+    - No → enter correction mode
+    - Unclear → re-ask
+    """
+    user_input = state.get("raw_transcript", "").strip()
+    extracted_fields = state.get("extracted_fields", {})
+    page_fields = state.get("page_fields", [])
+    label_map = _build_label_map(page_fields)
+
+    if _is_yes(user_input):
+        return {
+            "confirm_route": "fill",
+        }
+
+    elif _is_no(user_input):
+        # Show current values and ask which field to correct
+        summary_html = _build_summary_html(extracted_fields, label_map)
+        return {
+            "conversation_phase": "correcting",
+            "confirm_route": "end",
+            "bot_response": {
+                "action": "ask_correction",
+                "message": (
+                    f"🔧 No problem! Which field is wrong?<br><br>"
+                    f"{summary_html}<br><br>"
+                    f"Tell me the field name — for example: <i>\"name is wrong\"</i>"
+                ),
+                "speak_text": "Which field is wrong? Tell me the field name.",
+                "status_text": "Correction mode — tell me which field",
+            },
+        }
+
+    else:
+        return {
+            "confirm_route": "end",
+            "bot_response": {
+                "action": "confirm_fill",
+                "message": "🤔 I didn't catch that. Please say <b>yes</b> to fill or <b>no</b> to correct.",
+                "speak_text": "Please say yes to fill or no to correct.",
+                "status_text": "Waiting for confirmation…",
+            },
+        }
+
+
+# ============================================================
+# NODE 6: CORRECTION HANDLER (correcting + spelling + spell_confirm)
+# ============================================================
+
+def correction_handler_node(state: WebSenseState) -> dict[str, Any]:
+    """
+    Handles the full correction flow across sub-phases:
+     - correcting: identify which field user wants to fix
+     - spelling: collect letters or whole-word replacement
+     - spell_confirm: confirm the new spelling, apply or retry
+    """
+    phase = state.get("conversation_phase", "correcting")
+    user_input = state.get("raw_transcript", "").strip()
+    lower = user_input.lower().strip()
+    extracted_fields = state.get("extracted_fields", {})
+    page_fields = state.get("page_fields", [])
+    label_map = _build_label_map(page_fields)
+    correcting_key = state.get("correcting_field_key", "")
+    spelling_buffer = state.get("spelling_buffer", "")
+
+    # ── SUB-PHASE: correcting (identify which field) ──
+    if phase == "correcting":
+        matched_field = None
+
+        # Try matching user words against field keys and labels
+        for key in extracted_fields:
+            pretty = _pretty(key, label_map).lower()
+            if pretty in lower or key.lower() in lower:
+                matched_field = key
+                break
+
+        # Fuzzy match common words
+        if not matched_field:
+            common_words = {
+                "name": ["name", "first", "last", "username"],
+                "email": ["email", "mail"],
+                "phone": ["phone", "mobile", "tel"],
+                "address": ["address", "street", "city"],
+            }
+            for key in extracted_fields:
+                key_lower = key.lower()
+                for words in common_words.values():
+                    if any(w in key_lower and w in lower for w in words):
+                        matched_field = key
+                        break
+                if matched_field:
+                    break
+
+        if not matched_field:
+            summary_html = _build_summary_html(extracted_fields, label_map)
+            return {
+                "correction_route": "end",
+                "bot_response": {
+                    "action": "ask_correction",
+                    "message": (
+                        f"🤔 I'm not sure which field you mean. Here are the current values:<br><br>"
+                        f"{summary_html}<br><br>"
+                        f"Please say the field name you want to correct."
+                    ),
+                    "speak_text": "I'm not sure which field. Please say the field name.",
+                    "status_text": "Tell me which field to correct",
+                },
             }
 
-            # Record correction in conversation history
-            conversation_history = conversation_history.copy()
-            conversation_history.append({
-                "turn": state.get("turn_count", 0) + 1,
-                "role": "user",
-                "content": f"Correction: {corrected_field} -> {new_value}",
-            })
+        current_value = ""
+        fd = extracted_fields.get(matched_field, {})
+        if isinstance(fd, dict):
+            current_value = fd.get("value", "")
+        pretty_name = _pretty(matched_field, label_map)
+
+        return {
+            "conversation_phase": "spelling",
+            "correcting_field_key": matched_field,
+            "spelling_buffer": "",
+            "correction_route": "end",
+            "bot_response": {
+                "action": "ask_spelling",
+                "message": (
+                    f"📝 Current value for <b>{pretty_name}</b>: <b>{current_value}</b><br><br>"
+                    f"🔤 Please tell me the correct value, or spell it letter by letter.<br>"
+                    f"Say <b>\"done\"</b> when finished."
+                ),
+                "correcting_field": pretty_name,
+                "current_value": current_value,
+                "spell_aloud": {"field": pretty_name, "value": current_value},
+                "speak_text": f"Current value for {pretty_name} is {current_value}. Please tell me the correct spelling.",
+                "status_text": f'Spelling mode — correct "{pretty_name}"',
+            },
+        }
+
+    # ── SUB-PHASE: spelling (collect letters) ──
+    elif phase == "spelling":
+        pretty_name = _pretty(correcting_key, label_map)
+
+        # Check for "done"
+        if lower in DONE_WORDS:
+            if not spelling_buffer.strip():
+                return {
+                    "correction_route": "end",
+                    "bot_response": {
+                        "action": "ask_spelling",
+                        "message": "⚠️ You haven't spelled anything yet. Say the letters, or <b>\"cancel\"</b> to go back.",
+                        "speak_text": "You haven't spelled anything yet.",
+                        "status_text": f'Spelling "{pretty_name}"…',
+                    },
+                }
+
+            return {
+                "conversation_phase": "spell_confirm",
+                "correction_route": "end",
+                "bot_response": {
+                    "action": "confirm_spelling",
+                    "message": (
+                        f"📝 I got: <b>{spelling_buffer.strip()}</b><br><br>"
+                        f"👉 Is this correct? Say <b>yes</b> to apply or <b>no</b> to spell again."
+                    ),
+                    "spelled_value": spelling_buffer.strip(),
+                    "correcting_field": pretty_name,
+                    "spell_aloud": {"field": pretty_name, "value": spelling_buffer.strip()},
+                    "speak_text": f"I got {spelling_buffer.strip()}. Is this correct?",
+                    "status_text": "Confirm spelling…",
+                },
+            }
+
+        # Check for "cancel"
+        if lower in CANCEL_WORDS:
+            return {
+                "conversation_phase": "confirming",
+                "correcting_field_key": "",
+                "spelling_buffer": "",
+                "correction_route": "end",
+                "bot_response": {
+                    "action": "confirm_fill",
+                    "message": "↩️ Cancelled. Should I fill the original values? Say <b>yes</b> or <b>no</b>.",
+                    "speak_text": "Cancelled. Should I fill the original values?",
+                    "status_text": "Waiting for confirmation…",
+                },
+            }
+
+        # Parse input: single letters or whole word
+        letters = user_input.replace(",", " ").replace(".", " ").strip()
+        parts = letters.split()
+        all_single = all(len(p) == 1 for p in parts)
+
+        if all_single and parts:
+            new_buffer = spelling_buffer + "".join(parts)
+            return {
+                "spelling_buffer": new_buffer,
+                "correction_route": "end",
+                "bot_response": {
+                    "action": "ask_spelling",
+                    "message": f"🔤 Got it: <b>{new_buffer}</b> (say more letters, or <b>\"done\"</b> when finished)",
+                    "spelled_value": new_buffer,
+                    "status_text": f'Spelling "{pretty_name}": {new_buffer}',
+                },
+            }
+        else:
+            # Whole word — go straight to confirmation
+            return {
+                "conversation_phase": "spell_confirm",
+                "spelling_buffer": user_input.strip(),
+                "correction_route": "end",
+                "bot_response": {
+                    "action": "confirm_spelling",
+                    "message": (
+                        f"📝 I got: <b>{user_input.strip()}</b><br>"
+                        f"👉 Is this correct? Say <b>yes</b> or <b>no</b>."
+                    ),
+                    "spelled_value": user_input.strip(),
+                    "correcting_field": pretty_name,
+                    "spell_aloud": {"field": pretty_name, "value": user_input.strip()},
+                    "speak_text": f"I got {user_input.strip()}. Is this correct?",
+                    "status_text": "Confirm spelling…",
+                },
+            }
+
+    # ── SUB-PHASE: spell_confirm (apply or retry) ──
+    elif phase == "spell_confirm":
+        pretty_name = _pretty(correcting_key, label_map)
+
+        if _is_yes(lower):
+            # Apply correction
+            updated_fields = {**extracted_fields}
+            if correcting_key in updated_fields:
+                fd = updated_fields[correcting_key]
+                if isinstance(fd, dict):
+                    updated_fields[correcting_key] = {
+                        **fd,
+                        "value": spelling_buffer.strip(),
+                        "confidence": 0.95,
+                        "source_text": f"Spelling correction: {spelling_buffer.strip()}",
+                    }
+                else:
+                    updated_fields[correcting_key] = {
+                        "value": spelling_buffer.strip(),
+                        "confidence": 0.95,
+                        "source_text": f"Spelling correction: {spelling_buffer.strip()}",
+                    }
 
             return {
                 "extracted_fields": updated_fields,
-                "correction_mode": False,
-                "conversation_history": conversation_history,
-                "error_message": "",
+                "correcting_field_key": "",
+                "spelling_buffer": "",
+                "correction_route": "review",  # Route back to review for re-confirmation
+                "bot_response": {
+                    "action": "show_fields",
+                    "message": f"✅ Updated <b>{pretty_name}</b> to <b>{spelling_buffer.strip()}</b>!",
+                    "speak_text": f"Updated {pretty_name} to {spelling_buffer.strip()}.",
+                    "status_text": "Correction applied",
+                },
             }
+
+        elif _is_no(lower):
+            return {
+                "conversation_phase": "spelling",
+                "spelling_buffer": "",
+                "correction_route": "end",
+                "bot_response": {
+                    "action": "ask_spelling",
+                    "message": (
+                        f"🔄 Let's try again. Please spell <b>{pretty_name}</b> letter by letter.<br>"
+                        f"Say <b>\"done\"</b> when finished."
+                    ),
+                    "speak_text": f"Let's try again. Please spell {pretty_name}.",
+                    "status_text": f'Re-spelling "{pretty_name}"…',
+                },
+            }
+
         else:
             return {
-                "correction_mode": False,
-                "needs_clarification": True,
-                "clarification_question": "I couldn't identify which field to correct. Could you be more specific?",
+                "correction_route": "end",
+                "bot_response": {
+                    "action": "confirm_spelling",
+                    "message": "🤔 Please say <b>yes</b> to apply, or <b>no</b> to spell again.",
+                    "speak_text": "Please say yes to apply or no to spell again.",
+                    "status_text": "Confirm spelling…",
+                },
             }
 
-    except Exception as e:
-        return {
-            "correction_mode": False,
-            "error_message": f"Correction processing failed: {str(e)}",
-            "needs_clarification": True,
-            "clarification_question": "I had trouble processing the correction. Could you try again?",
-        }
+    # Fallback
+    return {
+        "conversation_phase": "idle",
+        "correction_route": "end",
+        "bot_response": {
+            "action": "error",
+            "message": "⚠️ Something went wrong. Let's start over.",
+            "status_text": "Error",
+        },
+    }
 
 
 # ============================================================
-# NODE 6: OUTPUT
+# NODE 7: FILL (replaces old output_node)
 # ============================================================
 
-def output_node(state: WebSenseState) -> dict[str, Any]:
+def fill_node(state: WebSenseState) -> dict[str, Any]:
     """
-    Assembles the final JSON payload for the Chrome extension.
-
-    The structure matches exactly what content.js expects to
-    execute form filling on the page.
-
-    Args:
-        state: Current graph state with all fields populated.
-
-    Returns:
-        Dict of state updates: final_payload.
+    Assembles the final fill payload and returns action="execute_fill".
+    Called only after the user confirms "yes".
     """
     extracted_fields: dict = state.get("extracted_fields", {})
     matched_selectors: dict = state.get("matched_selectors", {})
     confidence_scores: dict = state.get("confidence_scores", {})
-    missing_fields: list = state.get("missing_fields", [])
+    page_fields: list[dict] = state.get("page_fields", [])
     contains_sensitive: bool = state.get("contains_sensitive", False)
     session_id: str = state.get("session_id", "")
 
-    # Build fields_to_fill with selectors merged in
+    label_map = _build_label_map(page_fields)
+
     fields_to_fill: dict = {}
     summary: dict = {}
+    summary_lines = []
 
     for field_name, field_data in extracted_fields.items():
-        value = field_data.get("value", "")
-        confidence = confidence_scores.get(field_name, field_data.get("confidence", 0.5))
+        value = field_data.get("value", "") if isinstance(field_data, dict) else field_data
+        if not value:
+            continue
+        confidence = confidence_scores.get(field_name, field_data.get("confidence", 0.5) if isinstance(field_data, dict) else 0.8)
         selectors = matched_selectors.get(field_name, [])
-        source_text = field_data.get("source_text", "")
 
         fields_to_fill[field_name] = {
             "value": value,
             "confidence": confidence,
             "selectors": selectors,
-            "source_text": source_text,
+            "source_text": field_data.get("source_text", "") if isinstance(field_data, dict) else "",
         }
         summary[field_name] = value
+        summary_lines.append(f"• <b>{_pretty(field_name, label_map)}</b>: {value}")
 
-    final_payload = {
-        "status": "success",
-        "session_id": session_id,
-        "fields_to_fill": fields_to_fill,
-        "missing_fields": missing_fields,
-        "needs_confirmation": False,
-        "sensitive_detected": contains_sensitive,
-        "summary": summary,
-    }
+    field_count = len(fields_to_fill)
+    summary_html = "<br>".join(summary_lines)
 
     return {
-        "final_payload": final_payload,
+        "conversation_phase": "idle",
+        "bot_response": {
+            "action": "execute_fill",
+            "message": (
+                f"✅ Filling <b>{field_count}</b> field{'s' if field_count > 1 else ''}!<br><br>"
+                f"{summary_html}"
+            ),
+            "fields_to_fill": fields_to_fill,
+            "summary": summary,
+            "fields_summary": {_pretty(k, label_map): v for k, v in summary.items()},
+            "speak_text": f"Filling {field_count} fields.",
+            "status_text": f"Filled {field_count} fields ✓",
+        },
+    }
+
+
+# ============================================================
+# NODE 8: SPELL READOUT
+# ============================================================
+
+def spell_readout_node(state: WebSenseState) -> dict[str, Any]:
+    """
+    Handles the "spell <field>" command.
+    Finds the field value and returns spell_aloud data for TTS.
+    """
+    user_input = state.get("raw_transcript", "").strip()
+    lower = user_input.lower()
+    spell_match = re.match(r'^spell\s+(.+)', lower)
+    search_term = spell_match.group(1) if spell_match else lower
+
+    extracted_fields = state.get("extracted_fields", {})
+    page_fields = state.get("page_fields", [])
+    label_map = _build_label_map(page_fields)
+
+    # Search for matching field
+    matched_key = None
+    matched_value = None
+
+    for key, data in extracted_fields.items():
+        pretty = _pretty(key, label_map).lower()
+        val = data.get("value", "") if isinstance(data, dict) else data
+        if pretty in search_term or key.lower() in search_term or search_term in pretty:
+            matched_key = key
+            matched_value = val
+            break
+
+    # Fuzzy fallback
+    if not matched_key:
+        for key, data in extracted_fields.items():
+            kw = key.lower().replace("_", " ").replace("-", " ")
+            val = data.get("value", "") if isinstance(data, dict) else data
+            if any(w in kw for w in search_term.split()):
+                matched_key = key
+                matched_value = val
+                break
+
+    if not matched_key or not matched_value:
+        available = _build_summary_html(extracted_fields, label_map)
+        return {
+            "bot_response": {
+                "action": "show_fields",
+                "message": (
+                    f"🤔 I don't have a value for \"<b>{search_term}</b>\".<br><br>"
+                    + (f"Here's what I have:<br>{available}" if available else "No fields extracted yet.")
+                ),
+                "speak_text": f"I don't have a value for {search_term}.",
+                "status_text": "Field not found",
+            },
+        }
+
+    pretty = _pretty(matched_key, label_map)
+    return {
+        "bot_response": {
+            "action": "spell_readout",
+            "message": f"🔤 Spelling <b>{pretty}</b>: <b>{matched_value}</b>",
+            "spell_aloud": {"field": pretty, "value": matched_value},
+            "speak_text": f"Spelling {pretty}",
+            "status_text": f"Spelling {pretty}…",
+        },
     }
 
 
@@ -739,8 +1125,13 @@ def _regex_fallback_extract(transcript: str) -> dict:
             "source_text": email_match.group(),
         }
 
-    # Phone pattern
-    phone_match = re.search(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", transcript)
+    # Phone pattern (supports US, Pakistani 03xx-xxxxxxx, international +xx formats)
+    phone_match = re.search(
+        r"\b(?:"
+        r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{3,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}"
+        r"|0\d{3}[-.\s]?\d{7}"
+        r"|\+\d{1,3}[-.\s]?\d{3,4}[-.\s]?\d{3,4}[-.\s]?\d{3,4}"
+        r")\b", transcript)
     if phone_match:
         fields["phone"] = {
             "value": phone_match.group(),
@@ -748,16 +1139,49 @@ def _regex_fallback_extract(transcript: str) -> dict:
             "source_text": phone_match.group(),
         }
 
-    # Name pattern ("my name is ..." or "name is ...")
-    name_match = re.search(r"(?:my\s+)?name\s+is\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", transcript, re.IGNORECASE)
-    if name_match:
+    # Phone spoken as "number is ..." or "phone is ..."
+    phone_spoken = re.search(
+        r"(?:my\s+)?(?:phone|number|mobile|cell|contact)\s+(?:number\s+)?is\s+([\d\s+\-().x]+)",
+        transcript, re.IGNORECASE)
+    if phone_spoken and "phone" not in fields:
+        raw_phone = phone_spoken.group(1).strip()
+        # Clean up spoken separators
+        cleaned_phone = re.sub(r'\s+', '', raw_phone)
+        if len(cleaned_phone) >= 7:  # at least 7 digits
+            fields["phone"] = {
+                "value": raw_phone,
+                "confidence": 0.8,
+                "source_text": phone_spoken.group(0),
+            }
+
+    # First name pattern
+    first_name_match = re.search(r"(?:my\s+)?first\s+name\s+is\s+([A-Za-z]+)", transcript, re.IGNORECASE)
+    if first_name_match:
+        fields["first_name"] = {
+            "value": first_name_match.group(1).strip(),
+            "confidence": 0.9,
+            "source_text": first_name_match.group(0),
+        }
+
+    # Last name pattern
+    last_name_match = re.search(r"(?:my\s+)?last\s+name\s+is\s+([A-Za-z]+)", transcript, re.IGNORECASE)
+    if last_name_match:
+        fields["last_name"] = {
+            "value": last_name_match.group(1).strip(),
+            "confidence": 0.9,
+            "source_text": last_name_match.group(0),
+        }
+
+    # Name pattern ("my name is ..." or "name is ..." — handles any casing)
+    name_match = re.search(r"(?:my\s+)?name\s+is\s+([A-Za-z]+(?:\s+[A-Za-z]+)*)", transcript, re.IGNORECASE)
+    if name_match and "first_name" not in fields:
         fields["name"] = {
-            "value": name_match.group(1).strip(),
-            "confidence": 0.8,
+            "value": name_match.group(1).strip().title(),
+            "confidence": 0.85,
             "source_text": name_match.group(0),
         }
 
-    # Email spoken as "email is ..."
+    # Email spoken as "email is ..." (with at/dot as words)
     email_spoken = re.search(r"email\s+is\s+([\w.+-]+\s*(?:at|@)\s*[\w-]+\s*(?:dot|\.)\s*\w+)", transcript, re.IGNORECASE)
     if email_spoken and "email" not in fields:
         raw_email = email_spoken.group(1)
