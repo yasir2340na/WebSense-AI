@@ -508,8 +508,10 @@
   function buildFieldChips(fields) {
     if (!fields || fields.length === 0) return '';
     const chips = fields.map((f) => {
-      const name = f.label || f.name || f.id || f.placeholder || 'Unknown';
-      const isFilled = filledFields[f.name] || filledFields[f.id];
+      // Use _essentialLabel if available (enriched fields), otherwise fall back to prettyName
+      const name = f._essentialLabel || prettyName(f.label || f.placeholder || f.name || f.id) || f.label || f.name || f.id || 'Field';
+      const key = f.name || f.id;
+      const isFilled = filledFields[key];
       const cls = isFilled ? 'filled' : 'empty';
       const req = f.isRequired ? ' required' : '';
       const icon = isFilled ? '✓' : '○';
@@ -529,6 +531,12 @@
         }
       }
     }
+    // Detect garbled/obfuscated names (e.g. Facebook's "_R_mad6p4jikacppb6amH2_")
+    // Pattern: contains random mix of letters+digits, or starts with underscores, or too many consonants
+    const isGarbled = /^_?[A-Za-z]*\d{3,}|\d[A-Za-z]\d|[a-z]{2}\d{2,}[a-z]/i.test(raw) ||
+                      raw.replace(/[^a-zA-Z]/g, '').length < raw.length * 0.5;
+    if (isGarbled) return null; // signal that this field has no readable name
+
     // Fallback: basic formatting
     return raw
       .replace(/([a-z])([A-Z])/g, '$1 $2')
@@ -678,11 +686,77 @@
         tagName: el.tagName.toLowerCase(),
         currentValue: el.value || '',
         formId: el.form ? (el.form.id || el.form.getAttribute('name') || '') : '',
+        // Collect <option> values for <select> dropdowns
+        options: el.tagName === 'SELECT'
+          ? Array.from(el.options)
+              .filter(opt => opt.value && opt.value !== '' && !opt.disabled)
+              .map(opt => ({ value: opt.value, text: opt.textContent.trim() }))
+          : undefined,
       });
     }
 
     // 1. Standard inputs, selects, textareas
     document.querySelectorAll('input, select, textarea').forEach(processElement);
+
+    // 1b. Group radio buttons: collapse multiple <input type="radio"> with same name
+    // into a single virtual field with options
+    const radioGroups = {};
+    for (let i = fields.length - 1; i >= 0; i--) {
+      const f = fields[i];
+      if (f.type === 'radio' && f.name) {
+        if (!radioGroups[f.name]) {
+          radioGroups[f.name] = { field: f, options: [], indices: [] };
+        }
+        // Collect each radio's value and label as an option
+        const radioLabel = f.label || f.ariaLabel || f.currentValue || f.id || '';
+        radioGroups[f.name].options.push({
+          value: f.currentValue || f.id || '',
+          text: radioLabel,
+        });
+        radioGroups[f.name].indices.push(i);
+      }
+    }
+    // Replace individual radio inputs with a single grouped field
+    for (const [radioName, group] of Object.entries(radioGroups)) {
+      if (group.options.length > 1) {
+        // Remove all individual radio entries (reverse order to preserve indices)
+        const sortedIndices = [...group.indices].sort((a, b) => b - a);
+        for (const idx of sortedIndices) fields.splice(idx, 1);
+        // Get the group label from the first radio or a shared <legend>/<label>
+        let groupLabel = '';
+        const firstRadio = document.querySelector(`input[type="radio"][name="${radioName}"]`);
+        if (firstRadio) {
+          const fieldset = firstRadio.closest('fieldset');
+          if (fieldset) {
+            const legend = fieldset.querySelector('legend');
+            if (legend) groupLabel = legend.textContent.trim();
+          }
+          if (!groupLabel) {
+            // Try shared label
+            const parent = firstRadio.closest('[role="radiogroup"], [aria-label]');
+            if (parent) groupLabel = parent.getAttribute('aria-label') || '';
+          }
+        }
+        if (!groupLabel) groupLabel = group.field.label || radioName;
+        // Add the grouped radio field
+        fields.push({
+          id: '',
+          name: radioName,
+          type: 'radio-group',
+          placeholder: '',
+          label: groupLabel,
+          ariaLabel: '',
+          autocomplete: '',
+          selector: `input[type="radio"][name="${radioName}"]`,
+          isRequired: group.field.isRequired,
+          isVisible: group.field.isVisible,
+          tagName: 'input',
+          currentValue: '',
+          formId: group.field.formId || '',
+          options: group.options,
+        });
+      }
+    }
 
     // 2. Elements with contenteditable
     document.querySelectorAll('[contenteditable="true"], [contenteditable=""]').forEach((el) => {
@@ -708,26 +782,84 @@
       });
     });
 
-    // 3. ARIA role=textbox / role=combobox (custom components)
-    document.querySelectorAll('[role="textbox"], [role="combobox"], [role="searchbox"], [role="spinbutton"]').forEach((el) => {
+    // 3. ARIA role=textbox / role=combobox + elements with popup/expanded attrs (custom components)
+    //    Covers: React, MUI, Ant Design, Headless UI, Radix, Chakra, etc.
+    const customSelectors = [
+      '[role="textbox"]', '[role="combobox"]', '[role="searchbox"]', '[role="spinbutton"]',
+      '[role="listbox"]', '[role="menu"]', '[role="menubutton"]',
+      '[aria-haspopup="listbox"]', '[aria-haspopup="true"]',
+      '[aria-expanded]', '[aria-controls]',
+    ];
+    document.querySelectorAll(customSelectors.join(', ')).forEach((el) => {
       if (seen.has(el) || el.matches('input, select, textarea')) return;
+      // Skip non-interactive containers (e.g. divs that merely hold aria-expanded for a child)
+      if (el.tagName === 'FORM' || el.tagName === 'SECTION' || el.tagName === 'MAIN') return;
       seen.add(el);
       const rect = el.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
+
+      // For combobox/listbox, try to collect options from associated listbox
+      let options;
+      const elRole = el.getAttribute('role') || '';
+      const hasPopup = el.getAttribute('aria-haspopup');
+      const isDropdownLike = elRole === 'combobox' || elRole === 'listbox' || elRole === 'menu' ||
+                             elRole === 'menubutton' || hasPopup === 'listbox' || hasPopup === 'true' ||
+                             el.getAttribute('aria-expanded') != null || el.getAttribute('aria-controls') != null;
+
+      if (isDropdownLike) {
+        // Check aria-controls or aria-owns for a linked listbox
+        const listboxId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
+        let listbox = listboxId ? document.getElementById(listboxId) : null;
+        // Also try sibling/parent listbox
+        if (!listbox) listbox = el.querySelector('[role="listbox"]');
+        if (!listbox && el.parentElement) listbox = el.parentElement.querySelector('[role="listbox"]');
+        if (listbox) {
+          const optEls = listbox.querySelectorAll('[role="option"]');
+          if (optEls.length > 0) {
+            options = Array.from(optEls).map(o => ({
+              value: o.getAttribute('data-value') || o.textContent.trim(),
+              text: o.textContent.trim(),
+            }));
+          }
+        }
+        // For Facebook-style combobox, gender options may be in aria-label or visible text nearby
+        if (!options || options.length === 0) {
+          // Try to find sibling option-like elements
+          const parent = el.closest('[role="group"]') || el.parentElement;
+          if (parent) {
+            const siblingOptions = parent.querySelectorAll('[role="option"], [data-value]');
+            if (siblingOptions.length > 0) {
+              options = Array.from(siblingOptions).map(o => ({
+                value: o.getAttribute('data-value') || o.textContent.trim(),
+                text: o.textContent.trim(),
+              }));
+            }
+          }
+        }
+      }
+
+      // Determine field type — be explicit about combobox-like elements
+      const fieldType = isDropdownLike ? 'combobox' : (el.getAttribute('role') || 'custom');
+      const fieldSelector = el.id ? `#${CSS.escape(el.id)}` 
+        : el.getAttribute('role') ? `[role="${el.getAttribute('role')}"]`
+        : el.getAttribute('aria-label') ? `[aria-label="${el.getAttribute('aria-label')}"]`
+        : '';
+
       fields.push({
         id: el.id || '',
         name: el.getAttribute('name') || '',
-        type: el.getAttribute('role'),
+        type: fieldType,
         placeholder: el.getAttribute('aria-placeholder') || '',
         label: el.getAttribute('aria-label') || '',
         ariaLabel: el.getAttribute('aria-label') || '',
         autocomplete: '',
-        selector: el.id ? `#${CSS.escape(el.id)}` : `[role="${el.getAttribute('role')}"]`,
+        selector: fieldSelector,
         isRequired: el.getAttribute('aria-required') === 'true',
         isVisible: true,
         tagName: el.tagName.toLowerCase(),
         currentValue: el.textContent || '',
         formId: '',
+        options,
       });
     });
 
@@ -779,10 +911,38 @@
    */
   function getAllFormFields(allFields) {
     const visible = allFields.filter((f) => f.isVisible);
-    return visible.map((f) => ({
-      ...f,
-      _essentialLabel: prettyName(f.label || f.placeholder || f.name || f.id || 'Field'),
-    }));
+    return visible
+      .map((f) => {
+        // Try multiple sources for a human-readable label
+        const rawLabel = f.label || f.placeholder || f.ariaLabel;
+        let label;
+        if (rawLabel) {
+          label = rawLabel.replace(/\s*\*\s*$/, '').trim();
+        } else {
+          // Fall back to name/id but check if it's readable
+          label = prettyName(f.name || f.id || 'Field');
+        }
+        // If prettyName returned null (garbled name), try to infer from options/type
+        if (!label) {
+          if (f.options && f.options.length > 0) {
+            // Infer from options content (e.g., options like "Female", "Male" → "Gender")
+            const optTexts = f.options.map(o => (o.text || o.value).toLowerCase());
+            if (optTexts.some(t => t.includes('female') || t.includes('male'))) label = 'Gender';
+            else if (optTexts.some(t => /^\d+$/.test(t) && parseInt(t) <= 31)) label = 'Day';
+            else if (optTexts.some(t => /jan|feb|mar|apr|may|jun/i.test(t))) label = 'Month';
+            else if (optTexts.some(t => /^(19|20)\d{2}$/.test(t))) label = 'Year';
+            else label = 'Selection';
+          } else {
+            label = `Field ${f.type || 'unknown'}`;
+          }
+        }
+        return { ...f, _essentialLabel: label };
+      })
+      .filter((f) => {
+        // Exclude submit buttons, button types, and hidden fields
+        const skipTypes = ['submit', 'button', 'reset', 'image', 'hidden'];
+        return !skipTypes.includes(f.type);
+      });
   }
 
   /**
@@ -864,9 +1024,14 @@
     const formInfo = classifyForm(visibleFields);
     const fieldCount = visibleFields.length;
 
-    // Pre-fill filledFields with any already-filled values
+    // Pre-fill filledFields ONLY for text-like inputs with genuine pre-existing values.
+    // NEVER pre-fill for select/radio/combobox/listbox — their currentValue is just
+    // the default placeholder (e.g., "0", "Day", "Month") and should NOT cause skipping.
     visibleFields.forEach((f) => {
-      if (f.currentValue) {
+      const isChoiceField = /select|radio|combobox|listbox/i.test(
+        `${f.type} ${f.tagName} ${f.type === 'radio-group' ? 'radio' : ''}`
+      );
+      if (!isChoiceField && f.currentValue && f.currentValue.trim()) {
         const key = f.name || f.id;
         if (key) filledFields[key] = f.currentValue;
       }
@@ -894,7 +1059,7 @@
           `I found these important fields: <b>${essentialNames}</b><br><br>` +
           `✅ I have your details saved from last time!`;
 
-        addMessage(greeting + buildFieldChips(visibleFields), 'bot', '', true);
+        addMessage(greeting + buildFieldChips(essentialFields), 'bot', '', true);
 
         const summaryLines = Object.entries(savedProfile).map(
           ([k, v]) => `• <b>${prettyName(k)}</b>: ${v}`
@@ -914,7 +1079,7 @@
           `${formInfo.icon} I detected a <b>${formInfo.type} Form</b> with <b>${fieldCount} field${fieldCount > 1 ? 's' : ''}</b>.<br><br>` +
           `I found these fields: <b>${essentialNames}</b>`;
 
-        addMessage(greeting + buildFieldChips(visibleFields), 'bot', '', true);
+        addMessage(greeting + buildFieldChips(essentialFields), 'bot', '', true);
 
         // Auto-start field-by-field mode immediately
         startFieldByField();
@@ -956,12 +1121,26 @@
     while (currentFieldIndex < essentialFields.length) {
       const f = essentialFields[currentFieldIndex];
       const key = f.name || f.id;
-      if (f.currentValue || filledFields[key]) {
-        // Already has a value — skip silently
-        if (!filledFields[key] && f.currentValue) filledFields[key] = f.currentValue;
+
+      // Only skip if WE already filled this field in this session
+      if (filledFields[key]) {
         currentFieldIndex++;
         continue;
       }
+
+      // For text inputs that already have user-entered values, skip them
+      // But NEVER auto-skip select/dropdown/radio/combobox fields — their
+      // "currentValue" is always the default placeholder (Day/Month/Year/0/etc.)
+      const isChoiceField = /select|radio|combobox|listbox|menu|dropdown/i.test(
+        `${f.type} ${f.tagName} ${f.type === 'radio-group' ? 'radio' : ''}`
+      ) || (f.options && f.options.length > 0);
+      if (!isChoiceField && f.currentValue && f.currentValue.trim()) {
+        // Text input with a pre-existing value — skip it
+        filledFields[key] = f.currentValue;
+        currentFieldIndex++;
+        continue;
+      }
+
       break;
     }
 
@@ -975,37 +1154,117 @@
     const label = field._essentialLabel;
     const stepText = `${currentFieldIndex + 1}/${essentialFields.length}`;
 
+    // Build smart options hint — show useful context without overwhelming the user
+    let optionsHint = '';
+    let optionsHintForTTS = ''; // shorter version for speech
+    if (field.options && field.options.length > 0) {
+      const opts = field.options.map(o => o.text || o.value);
+      const isNumericRange = opts.length > 5 && opts.every(o => /^\d+$/.test(o));
+      const isMonthList = opts.some(o => /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(o));
+      const isYearRange = opts.length > 5 && opts.every(o => /^(19|20)\d{2}$/.test(o));
+
+      if (isNumericRange) {
+        // Numeric range like days 1-31 — show range, don't list all
+        const nums = opts.map(Number).sort((a, b) => a - b);
+        optionsHint = `<br>📋 Range: <b>${nums[0]}</b> to <b>${nums[nums.length - 1]}</b>`;
+        optionsHintForTTS = `Choose a number from ${nums[0]} to ${nums[nums.length - 1]}.`;
+      } else if (isYearRange) {
+        // Year range — show range
+        const years = opts.map(Number).sort((a, b) => a - b);
+        optionsHint = `<br>📋 Range: <b>${years[0]}</b> to <b>${years[years.length - 1]}</b>`;
+        optionsHintForTTS = `Choose a year from ${years[0]} to ${years[years.length - 1]}.`;
+      } else if (isMonthList) {
+        // Months — show all (only 12)
+        optionsHint = `<br>📋 Options: <b>${opts.join('</b>, <b>')}</b>`;
+        optionsHintForTTS = `Choose a month.`;
+      } else if (opts.length <= 6) {
+        // Small set — show all with TTS
+        optionsHint = `<br>📋 Options: <b>${opts.join('</b>, <b>')}</b>`;
+        optionsHintForTTS = `Options are: ${opts.join(', ')}.`;
+      } else {
+        // Large set — show first few + count
+        const preview = opts.slice(0, 5);
+        optionsHint = `<br>📋 ${opts.length} options available. Examples: <b>${preview.join('</b>, <b>')}</b> …`;
+        optionsHintForTTS = `There are ${opts.length} options available.`;
+      }
+    }
+
+    // Build display text (with full HTML) and speech text (clean, concise)
     let askText;
+    let askSpeech;
     if (currentFieldIndex === 0) {
       askText =
         `📝 Let's fill your form step by step! (${stepText})<br><br>` +
-        `👉 I'm now on the <b>${label}</b> field.<br>` +
+        `👉 I'm now on the <b>${label}</b> field.${optionsHint}<br>` +
         `What is your <b>${label}</b>?`;
+      askSpeech = `Let's fill your form step by step. Step ${stepText}. ` +
+        `What is your ${label}? ${optionsHintForTTS}`;
     } else {
       const prevField = essentialFields[currentFieldIndex - 1];
       askText =
         `✅ I've filled <b>${prevField._essentialLabel}</b>.<br><br>` +
-        `👉 Now I'm on the <b>${label}</b> field. (${stepText})<br>` +
+        `👉 Now I'm on the <b>${label}</b> field. (${stepText})${optionsHint}<br>` +
         `What is your <b>${label}</b>?`;
+      askSpeech = `Done. Step ${stepText}. What is your ${label}? ${optionsHintForTTS}`;
     }
 
-    addMessage(askText, 'bot', '', true);
+    // Display rich HTML in chat, but speak the concise version
+    addMessage(askText, 'bot', '', false); // don't auto-speak the raw HTML
+    speak(askSpeech); // speak the clean version
     setStatus(`Step ${stepText}: ${label}`);
     awaitingFieldInput = true;
   }
 
   /**
    * Fills a single field in the DOM by sending it through the background → content.js pipeline.
+   * For select/radio fields, tries to match the user's input to the closest available option.
    */
   async function fillSingleField(field, value) {
     const key = field.name || field.id;
+
+    // Smart option matching for select dropdowns and radio groups
+    let resolvedValue = value;
+    if (field.options && field.options.length > 0) {
+      const lowerVal = String(value).toLowerCase().trim();
+      // Try exact match first (value or text)
+      let match = field.options.find(
+        o => o.value.toLowerCase() === lowerVal || o.text.toLowerCase() === lowerVal
+      );
+      // Try numeric match (e.g., user says "15" → option value "15" or text "15")
+      if (!match && /^\d+$/.test(lowerVal)) {
+        match = field.options.find(
+          o => o.value === lowerVal || o.text === lowerVal ||
+               o.value === String(parseInt(lowerVal, 10)) ||
+               o.text === String(parseInt(lowerVal, 10))
+        );
+      }
+      // Try partial/contains match
+      if (!match) {
+        match = field.options.find(
+          o => o.text.toLowerCase().includes(lowerVal) || o.value.toLowerCase().includes(lowerVal)
+        );
+      }
+      // Try starts-with match (e.g. "jan" → "January")
+      if (!match) {
+        match = field.options.find(
+          o => o.text.toLowerCase().startsWith(lowerVal) || o.value.toLowerCase().startsWith(lowerVal)
+        );
+      }
+      if (match) {
+        resolvedValue = match.value;
+      }
+    }
+
     const fieldsToFill = {
       [key]: {
-        value,
+        value: resolvedValue,
         confidence: 1.0,
         selectors: field.selector ? [field.selector] : _buildSelectorsForKey(key),
+        fieldType: field.type,  // pass type for radio/select handling
       },
     };
+
+    console.log(`[WebSense PANEL DEBUG] fillSingleField: key="${key}", resolvedValue="${resolvedValue}", fieldType="${field.type}", selector="${field.selector}"`, fieldsToFill);
 
     const fillResp = await safeSendMessage({
       type: 'EXECUTE_CHAT_FILL',
@@ -1029,8 +1288,6 @@
     awaitingFieldInput = false;
     currentFieldIndex = -1;
 
-    const visibleFields = detectedFields.filter((f) => f.isVisible);
-
     // Show summary of what was filled
     const summaryLines = essentialFields.map((f) => {
       const key = f.name || f.id;
@@ -1039,7 +1296,7 @@
 
     addMessage(
       `🎉 <b>Form successfully filled!</b><br><br>${summaryLines}` +
-      buildFieldChips(visibleFields),
+      buildFieldChips(essentialFields),
       'bot', '', true
     );
     setStatus('Form successfully filled ✓', 'success');
@@ -1335,7 +1592,7 @@
       // If unclear input, fall through to normal processing
     }
 
-    // ── Handle field-by-field input ──
+    // ── Handle field-by-field input (AI-powered) ──
     if (awaitingFieldInput && fieldByFieldMode) {
       awaitingFieldInput = false;
       const field = essentialFields[currentFieldIndex];
@@ -1357,11 +1614,100 @@
         return;
       }
 
-      // Fill this single field in the DOM
-      await fillSingleField(field, value);
+      // ── Send to AI (Cohere via LangGraph) for intelligent interpretation ──
+      // Use bracket notation so the label doesn't trigger regex patterns
+      // (e.g. "Enter Your Name is ..." mistakenly matches the "name is" regex)
+      const fieldKey = field.name || field.id;
 
-      // Move to next field
-      currentFieldIndex++;
+      // For select/radio fields, include available options in the transcript
+      let optionsContext = '';
+      if (field.options && field.options.length > 0) {
+        const optVals = field.options.map(o => o.text || o.value).join(', ');
+        optionsContext = ` (available options: ${optVals})`;
+      }
+      const aiTranscript = `[current field: ${field._essentialLabel}${optionsContext}] ${value}`;
+
+      // Use a fresh sub-session per field so the LangGraph router always
+      // starts from "idle" → "extract" (not stuck in "confirming" from previous field)
+      const fieldSessionId = `${sessionId}_field_${currentFieldIndex}`;
+
+      const removeTyping = showTyping();
+      setStatus('🤖 AI processing…');
+
+      let aiFilled = false;
+      try {
+        const response = await safeSendMessage({
+          type: 'CHAT_FORM_FILL',
+          transcript: aiTranscript,
+          sessionId: fieldSessionId,
+          pageFields: detectedFields.filter((f) => f.isVisible),
+        });
+        removeTyping();
+
+        if (response && response.action !== 'error') {
+          // Extract the AI-processed values
+          const aiFields = response.fields_to_fill || response.summary || {};
+          const fieldsFilled = [];
+
+          for (const [key, data] of Object.entries(aiFields)) {
+            const val = typeof data === 'object' ? (data.value || data) : data;
+            if (!val) continue;
+
+            // Find matching field in our essentialFields list
+            const matchIdx = essentialFields.findIndex((ef) => {
+              const efKey = ef.name || ef.id;
+              return efKey === key || efKey.toLowerCase() === key.toLowerCase();
+            });
+
+            if (matchIdx >= 0) {
+              await fillSingleField(essentialFields[matchIdx], val);
+              fieldsFilled.push({ label: essentialFields[matchIdx]._essentialLabel, value: val });
+            }
+          }
+
+          // If AI filled at least the current field, mark success
+          if (fieldsFilled.length > 0) {
+            aiFilled = true;
+
+            // Show which extraction engine was used
+            const method = response.extraction_method || 'unknown';
+            const engineTag = method === 'cohere_llm' ? '🤖 Cohere AI'
+              : method === 'regex' ? '⚡ Regex'
+              : method === 'regex_fallback' ? '⚡ Regex (fallback)'
+              : '🤖 AI';
+
+            // Show AI confirmation with engine indicator
+            if (fieldsFilled.length === 1) {
+              addMessage(`${engineTag} filled <b>${fieldsFilled[0].label}</b>: <b>${fieldsFilled[0].value}</b>`, 'bot', '', false);
+            } else {
+              const lines = fieldsFilled.map(f => `• <b>${f.label}</b>: ${f.value}`).join('<br>');
+              addMessage(`${engineTag} filled <b>${fieldsFilled.length}</b> fields:<br>${lines}`, 'bot', '', false);
+            }
+
+            // Advance past all fields that were filled
+            while (currentFieldIndex < essentialFields.length) {
+              const efKey = essentialFields[currentFieldIndex].name || essentialFields[currentFieldIndex].id;
+              if (filledFields[efKey]) {
+                currentFieldIndex++;
+              } else {
+                break;
+              }
+            }
+          }
+        }
+      } catch (err) {
+        removeTyping();
+        console.warn('WebSense AI interpretation failed, using direct value:', err.message);
+      }
+
+      // ── Fallback: if AI didn't handle it, fill with the raw value directly ──
+      if (!aiFilled) {
+        await fillSingleField(field, value);
+        addMessage(`✅ Filled <b>${field._essentialLabel}</b>: <b>${value}</b>`, 'bot', '', false);
+        currentFieldIndex++;
+      }
+
+      // Ask for the next field
       askCurrentField();
       processingLock = false;
       return;

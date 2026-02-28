@@ -105,6 +105,12 @@ function scanPageFields() {
       isVisible,
       tagName: el.tagName.toLowerCase(),
       currentValue: el.value || '',
+      // Collect <option> values for <select> dropdowns
+      options: el.tagName === 'SELECT'
+        ? Array.from(el.options)
+            .filter(opt => opt.value && opt.value !== '' && !opt.disabled)
+            .map(opt => ({ value: opt.value, text: opt.textContent.trim() }))
+        : undefined,
     });
   });
 
@@ -164,7 +170,7 @@ function observeDynamicFields(callback) {
  * @param {Object} fieldsPayload - Map of fieldName -> { value, selectors, confidence }.
  * @returns {{ filled: Array, notFound: Array }} Report of what was and wasn't filled.
  */
-function fillFormFields(fieldsPayload) {
+async function fillFormFields(fieldsPayload) {
   const filled = [];
   const notFound = [];
 
@@ -244,7 +250,19 @@ function fillFormFields(fieldsPayload) {
       if (node.shadowRoot) pushInputsFromRoot(node.shadowRoot);
     });
 
+    // Separate native elements from ARIA elements — prefer native
+    const nativeCandidates = [];
+    const ariaCandidates = [];
     for (const el of candidates) {
+      if (el.matches('input, select, textarea')) {
+        nativeCandidates.push(el);
+      } else {
+        ariaCandidates.push(el);
+      }
+    }
+
+    // Search native elements first, then ARIA elements
+    const matchCandidate = (el) => {
       const id = normalizeToken(el.id || '');
       const name = normalizeToken(el.getAttribute('name') || '');
       const placeholder = normalizeToken(el.getAttribute('placeholder') || '');
@@ -267,64 +285,613 @@ function fillFormFields(fieldsPayload) {
       const labelNorm = normalizeToken(label);
 
       const values = [id, name, placeholder, ariaLabel, auto, labelNorm].filter(Boolean);
-      if (values.some((v) => v.includes(normalizedField) || normalizedField.includes(v))) {
-        return el;
-      }
+      return values.some((v) => v.includes(normalizedField) || normalizedField.includes(v));
+    };
+
+    // Prefer native <input>/<select>/<textarea> over ARIA role elements
+    for (const el of nativeCandidates) {
+      if (matchCandidate(el)) return el;
+    }
+    for (const el of ariaCandidates) {
+      if (matchCandidate(el)) return el;
     }
 
     return null;
   };
 
-  for (const [fieldName, fieldData] of Object.entries(fieldsPayload)) {
-    const { value, selectors = [], confidence = 0 } = fieldData;
+  console.log('%c[WebSense FILL DEBUG] ======= fillFormFields called =======', 'color: #FF6600; font-weight: bold;');
+  console.log('[WebSense FILL DEBUG] fieldsPayload:', JSON.stringify(fieldsPayload, null, 2));
 
-    if (!value) continue;
+  for (const [fieldName, fieldData] of Object.entries(fieldsPayload)) {
+    const { value, selectors = [], confidence = 0, fieldType = '' } = fieldData;
+
+    console.log(`%c[WebSense FILL DEBUG] --- Processing field: "${fieldName}" ---`, 'color: #0099FF; font-weight: bold;');
+    console.log(`[WebSense FILL DEBUG]   value: "${value}", fieldType: "${fieldType}", selectors:`, selectors);
+
+    if (!value) {
+      console.warn(`[WebSense FILL DEBUG]   SKIPPED — no value`);
+      continue;
+    }
+
+    // Special handling for radio-group: find all radios by name and match value
+    if (fieldType === 'radio-group') {
+      console.log(`[WebSense FILL DEBUG]   Branch: radio-group`);
+      const lowerVal = value.toLowerCase().trim();
+      const radios = document.querySelectorAll(`input[type="radio"][name="${fieldName}"]`);
+      let matched = false;
+      for (const radio of radios) {
+        const radioVal = (radio.value || '').toLowerCase();
+        let radioLabel = '';
+        if (radio.id) {
+          const lbl = document.querySelector(`label[for="${radio.id}"]`);
+          if (lbl) radioLabel = lbl.textContent.trim().toLowerCase();
+        }
+        if (!radioLabel && radio.closest('label')) {
+          radioLabel = radio.closest('label').textContent.trim().toLowerCase();
+        }
+        if (radioVal === lowerVal || radioLabel === lowerVal ||
+            radioLabel.includes(lowerVal) || radioVal.includes(lowerVal)) {
+          radio.focus();
+          radio.click();
+          radio.checked = true;
+          // Reset React's value tracker so it sees the change
+          const tracker = radio._valueTracker;
+          if (tracker) tracker.setValue('');
+          radio.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+          radio.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+          addFillHighlight(radio, confidence);
+          filled.push({ fieldName, value, selector: '', confidence });
+          matched = true;
+          break;
+        }
+      }
+      if (!matched && radios.length > 0) {
+        console.warn(`[WebSense FILL DEBUG]   radio-group: NO match found among ${radios.length} radios`);
+        notFound.push({ fieldName, value, selectors });
+      }
+      continue;
+    }
 
     let element = null;
+    let foundBy = 'none';
 
     // Try each selector in priority order
     for (const selector of selectors) {
       element = querySelectorEverywhere(selector);
-      if (element) break;
+      if (element) {
+        foundBy = `selector: ${selector}`;
+        break;
+      }
     }
 
     // Fallback match by field name semantics when selectors miss
     if (!element) {
       element = findByFieldNameFallback(fieldName);
+      if (element) foundBy = `fallback by name: ${fieldName}`;
+    }
+
+    if (!element) {
+      console.error(`[WebSense FILL DEBUG]   ❌ ELEMENT NOT FOUND for "${fieldName}". Tried selectors:`, selectors);
     }
 
     if (element) {
-      // Set the value
+      console.log(`[WebSense FILL DEBUG]   ✅ Element FOUND via ${foundBy}`);
+      console.log(`[WebSense FILL DEBUG]   Element details:`, {
+        tagName: element.tagName,
+        type: element.type,
+        id: element.id,
+        name: element.getAttribute('name'),
+        role: element.getAttribute('role'),
+        contentEditable: element.getAttribute('contenteditable'),
+        'instanceof HTMLInputElement': element instanceof HTMLInputElement,
+        'instanceof HTMLSelectElement': element instanceof HTMLSelectElement,
+        'instanceof HTMLTextAreaElement': element instanceof HTMLTextAreaElement,
+        currentValue: element.value,
+        currentTextContent: (element.textContent || '').substring(0, 100),
+        hasValueTracker: !!element._valueTracker,
+        optionsCount: element.options ? element.options.length : 'N/A',
+      });
+      // Native prototype setters — required for React/Vue/Angular compatibility.
+      // These frameworks override element.value setters; using the HTMLElement
+      // prototype setter bypasses the framework's interception.
       const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
         window.HTMLInputElement.prototype, 'value'
       )?.set;
       const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(
         window.HTMLTextAreaElement.prototype, 'value'
       )?.set;
+      const nativeSelectValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLSelectElement.prototype, 'value'
+      )?.set;
+
+      /**
+       * Helper: trigger the full event sequence React/Vue/Angular expect.
+       * React 16+ listens on the document for events with the SyntheticEvent
+       * system, but it also checks the element's internal value tracker.
+       * We reset that tracker so React sees the value as "new".
+       */
+      const triggerReactChange = (el) => {
+        // Reset React's internal value tracker so it detects the change
+        // React stores the last known value on a property like _valueTracker
+        const tracker = el._valueTracker;
+        if (tracker) {
+          tracker.setValue('');  // make React think the old value was different
+        }
+
+        // Dispatch the events React listens for
+        el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+      };
+
+      let branchTaken = 'unknown';
+      try {
 
       if (element.tagName === 'SELECT') {
+        branchTaken = 'SELECT';
         // For select elements, find and set the matching option
-        const option = Array.from(element.options).find(
-          (opt) => opt.value.toLowerCase() === value.toLowerCase() ||
-            opt.textContent.trim().toLowerCase() === value.toLowerCase()
+        element.focus();
+        const lowerVal = value.toLowerCase().trim();
+        console.log(`[WebSense FILL DEBUG]   Branch: SELECT — looking for value "${lowerVal}" among ${element.options.length} options`);
+        console.log(`[WebSense FILL DEBUG]   SELECT options:`, Array.from(element.options).map(o => `${o.value}="${o.textContent.trim()}"`));
+        let option = Array.from(element.options).find(
+          (opt) => opt.value.toLowerCase() === lowerVal ||
+            opt.textContent.trim().toLowerCase() === lowerVal
         );
-        if (option) {
-          element.value = option.value;
+        // Try numeric match (user says "15", option value might be "15" or text "15")
+        if (!option && /^\d+$/.test(lowerVal)) {
+          option = Array.from(element.options).find(
+            (opt) => opt.value === lowerVal || opt.textContent.trim() === lowerVal
+          );
+        }
+        // Try partial/contains match (user says "jan", option says "January")
+        if (!option) {
+          option = Array.from(element.options).find(
+            (opt) => opt.textContent.trim().toLowerCase().includes(lowerVal) ||
+              opt.value.toLowerCase().includes(lowerVal)
+          );
+        }
+        // Try starts-with match
+        if (!option) {
+          option = Array.from(element.options).find(
+            (opt) => opt.textContent.trim().toLowerCase().startsWith(lowerVal) ||
+              opt.value.toLowerCase().startsWith(lowerVal)
+          );
+        }
+        const finalVal = option ? option.value : value;
+        console.log(`[WebSense FILL DEBUG]   SELECT option matched:`, option ? `value="${option.value}" text="${option.textContent.trim()}"` : 'NONE — using raw value');
+        console.log(`[WebSense FILL DEBUG]   SELECT finalVal: "${finalVal}", valueBefore: "${element.value}"`);
+        // Use native HTMLSelectElement setter to bypass React's interception
+        if (nativeSelectValueSetter) {
+          nativeSelectValueSetter.call(element, finalVal);
+          console.log(`[WebSense FILL DEBUG]   SELECT used nativeSelectValueSetter`);
+        } else {
+          element.value = finalVal;
+          console.log(`[WebSense FILL DEBUG]   SELECT used direct assignment (no native setter!)`);
+        }
+        console.log(`[WebSense FILL DEBUG]   SELECT valueAfterSet: "${element.value}", hasTracker: ${!!element._valueTracker}`);
+        triggerReactChange(element);
+        console.log(`[WebSense FILL DEBUG]   SELECT valueAfterReactChange: "${element.value}"`);
+      } else if (element.tagName === 'INPUT' && element.type === 'radio') {
+        branchTaken = 'INPUT-radio';
+        console.log(`[WebSense FILL DEBUG]   Branch: INPUT-radio`);
+        // For radio buttons, find the radio in the same name group with matching value
+        const radioName = element.getAttribute('name');
+        if (radioName) {
+          const lowerVal = value.toLowerCase().trim();
+          const radios = document.querySelectorAll(`input[type="radio"][name="${radioName}"]`);
+          let matched = false;
+          for (const radio of radios) {
+            const radioVal = (radio.value || '').toLowerCase();
+            let radioLabel = '';
+            if (radio.id) {
+              const lbl = document.querySelector(`label[for="${radio.id}"]`);
+              if (lbl) radioLabel = lbl.textContent.trim().toLowerCase();
+            }
+            if (!radioLabel && radio.closest('label')) {
+              radioLabel = radio.closest('label').textContent.trim().toLowerCase();
+            }
+            if (radioVal === lowerVal || radioLabel === lowerVal ||
+                radioLabel.includes(lowerVal) || radioVal.includes(lowerVal)) {
+              radio.focus();
+              radio.click();
+              radio.checked = true;
+              triggerReactChange(radio);
+              addFillHighlight(radio, confidence);
+              matched = true;
+              break;
+            }
+          }
+          if (!matched) {
+            element.click();
+            element.checked = true;
+          }
+        } else {
+          element.click();
+          element.checked = true;
+        }
+      } else if (element.tagName === 'INPUT' && element.type === 'checkbox') {
+        branchTaken = 'INPUT-checkbox';
+        console.log(`[WebSense FILL DEBUG]   Branch: INPUT-checkbox`);
+        const lowerVal = value.toLowerCase().trim();
+        element.focus();
+        element.checked = ['true', 'yes', '1', 'on', 'checked'].includes(lowerVal);
+        triggerReactChange(element);
+      } else if (element.tagName === 'TEXTAREA') {
+        branchTaken = 'TEXTAREA';
+        console.log(`[WebSense FILL DEBUG]   Branch: TEXTAREA`);
+        element.focus();
+        if (nativeTextAreaValueSetter) {
+          nativeTextAreaValueSetter.call(element, value);
         } else {
           element.value = value;
         }
-      } else if (element.tagName === 'TEXTAREA' && nativeTextAreaValueSetter) {
-        nativeTextAreaValueSetter.call(element, value);
-      } else if (nativeInputValueSetter) {
-        nativeInputValueSetter.call(element, value);
+        triggerReactChange(element);
+        console.log(`[WebSense FILL DEBUG]   TEXTAREA valueAfter: "${element.value}"`);
+      } else if (element instanceof HTMLInputElement) {
+        branchTaken = 'HTMLInputElement';
+        console.log(`[WebSense FILL DEBUG]   Branch: HTMLInputElement (input type: ${element.type})`);
+        // Real <input> element — use native setter for React compatibility
+        element.focus();
+        console.log(`[WebSense FILL DEBUG]   INPUT valueBefore: "${element.value}"`);
+        if (nativeInputValueSetter) {
+          nativeInputValueSetter.call(element, value);
+          console.log(`[WebSense FILL DEBUG]   INPUT used nativeInputValueSetter`);
+        } else {
+          element.value = value;
+          console.log(`[WebSense FILL DEBUG]   INPUT used direct assignment (no native setter!)`);
+        }
+        console.log(`[WebSense FILL DEBUG]   INPUT valueAfterSet: "${element.value}", hasTracker: ${!!element._valueTracker}`);
+        triggerReactChange(element);
+        console.log(`[WebSense FILL DEBUG]   INPUT valueAfterReactChange: "${element.value}"`);
+      } else if (element.getAttribute &&
+                 (element.getAttribute('contenteditable') === 'true' ||
+                  element.getAttribute('role') === 'textbox')) {
+        branchTaken = 'contenteditable/textbox';
+        console.log(`[WebSense FILL DEBUG]   Branch: contenteditable/ARIA-textbox`);
+        console.log(`[WebSense FILL DEBUG]   contenteditable=${element.getAttribute('contenteditable')}, role=${element.getAttribute('role')}`);
+        // Contenteditable / ARIA textbox (Facebook-style custom input fields)
+        element.focus();
+        element.textContent = '';
+        // execCommand triggers React/framework synthetic events reliably
+        const execResult = document.execCommand('insertText', false, value);
+        console.log(`[WebSense FILL DEBUG]   execCommand('insertText') returned: ${execResult}, textContent after: "${element.textContent}"`);
+      } else if (element.getAttribute &&
+                 (element.getAttribute('role') === 'combobox' ||
+                  element.getAttribute('role') === 'listbox' ||
+                  element.getAttribute('role') === 'menu' ||
+                  element.getAttribute('role') === 'menubutton' ||
+                  element.getAttribute('aria-haspopup') === 'listbox' ||
+                  element.getAttribute('aria-haspopup') === 'true' ||
+                  element.getAttribute('aria-expanded') != null ||
+                  element.getAttribute('aria-controls') != null ||
+                  element.classList.contains('select') ||
+                  (element.getAttribute('class') || '').match(/select|dropdown|combobox/i) ||
+                  (element.getAttribute('data-testid') || '').match(/select|dropdown/i) ||
+                  fieldType === 'combobox' ||
+                  fieldType === 'select-custom')) {
+        branchTaken = 'combobox/listbox';
+        const elRole = element.getAttribute('role') || 'none';
+        console.log(`[WebSense FILL DEBUG]   Branch: combobox/listbox (role=${elRole}, fieldType=${fieldType}, tag=${element.tagName})`);
+
+        // ARIA combobox/listbox (e.g. Facebook date selects, gender selector)
+        const lowerVal = value.toLowerCase().trim();
+        let matched = false;
+
+        /**
+         * Simulate a real user click on a DOM element.
+         * Facebook React listens for pointer/mouse events with proper coordinates,
+         * not just bare .click() calls. This dispatches the full event sequence:
+         * pointerdown → mousedown → pointerup → mouseup → click
+         */
+        const simulateRealClick = (target) => {
+          const rect = target.getBoundingClientRect();
+          const x = rect.left + rect.width / 2;
+          const y = rect.top + rect.height / 2;
+          const eventOpts = {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: x,
+            clientY: y,
+            screenX: x,
+            screenY: y,
+            button: 0,
+            buttons: 1,
+          };
+
+          target.dispatchEvent(new PointerEvent('pointerdown', { ...eventOpts, pointerId: 1, pointerType: 'mouse' }));
+          target.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+          target.dispatchEvent(new PointerEvent('pointerup', { ...eventOpts, pointerId: 1, pointerType: 'mouse' }));
+          target.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+          target.dispatchEvent(new MouseEvent('click', eventOpts));
+          console.log(`[WebSense FILL DEBUG]   simulateRealClick on <${target.tagName}> "${target.textContent.trim().substring(0, 40)}" at (${Math.round(x)},${Math.round(y)})`);
+        };
+
+        // FAST PATH: Check if there's a native <select> inside or near this combobox wrapper
+        let nativeSelect = element.querySelector('select');
+        if (!nativeSelect && element.parentElement) {
+          nativeSelect = element.parentElement.querySelector('select');
+        }
+        if (!nativeSelect) {
+          // Check siblings
+          const siblings = element.parentElement ? element.parentElement.children : [];
+          for (const sib of siblings) {
+            if (sib.tagName === 'SELECT') { nativeSelect = sib; break; }
+            const inner = sib.querySelector && sib.querySelector('select');
+            if (inner) { nativeSelect = inner; break; }
+          }
+        }
+
+        if (nativeSelect) {
+          console.log(`[WebSense FILL DEBUG]   combobox: Found NATIVE <select> nearby! id=${nativeSelect.id}, options=${nativeSelect.options.length}`);
+          console.log(`[WebSense FILL DEBUG]   combobox: <select> options:`, Array.from(nativeSelect.options).slice(0, 15).map(o => `${o.value}="${o.textContent.trim()}"`));
+          nativeSelect.focus();
+          let option = Array.from(nativeSelect.options).find(
+            (opt) => opt.value.toLowerCase() === lowerVal || opt.textContent.trim().toLowerCase() === lowerVal
+          );
+          if (!option && /^\d+$/.test(lowerVal)) {
+            option = Array.from(nativeSelect.options).find(
+              (opt) => opt.value === lowerVal || opt.textContent.trim() === lowerVal
+            );
+          }
+          if (!option) {
+            option = Array.from(nativeSelect.options).find(
+              (opt) => opt.textContent.trim().toLowerCase().includes(lowerVal) || opt.value.toLowerCase().includes(lowerVal)
+            );
+          }
+          if (!option) {
+            option = Array.from(nativeSelect.options).find(
+              (opt) => opt.textContent.trim().toLowerCase().startsWith(lowerVal) || opt.value.toLowerCase().startsWith(lowerVal)
+            );
+          }
+          if (option) {
+            const selectSetter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')?.set;
+            if (selectSetter) {
+              selectSetter.call(nativeSelect, option.value);
+            } else {
+              nativeSelect.value = option.value;
+            }
+            triggerReactChange(nativeSelect);
+            console.log(`[WebSense FILL DEBUG]   combobox: Native <select> set to "${nativeSelect.value}" (wanted "${option.value}")`);
+            matched = true;
+          } else {
+            console.warn(`[WebSense FILL DEBUG]   combobox: Native <select> found but no matching option for "${lowerVal}"`);
+          }
+        } else {
+          console.log(`[WebSense FILL DEBUG]   combobox: No native <select> found nearby`);
+        }
+
+        // ── UNIVERSAL COMBOBOX/DROPDOWN HANDLER ──
+        // Works for: React portals (Facebook, MUI, Ant Design), Headless UI, Radix,
+        //            Chakra, native-like custom selects, ARIA combobox, etc.
+        if (!matched) {
+          // Step A: Collect ARIA option index (for keyboard fallback)
+          const listboxId = element.getAttribute('aria-controls') || element.getAttribute('aria-owns');
+          let optionIndex = -1;
+          let ariaOptCount = 0;
+          console.log(`[WebSense FILL DEBUG]   combobox: aria-controls/owns = "${listboxId}"`);
+          if (listboxId) {
+            const listbox = document.getElementById(listboxId);
+            if (listbox) {
+              const ariaOpts = listbox.querySelectorAll('[role="option"]');
+              ariaOptCount = ariaOpts.length;
+              console.log(`[WebSense FILL DEBUG]   combobox: ARIA listbox has ${ariaOpts.length} options`);
+              for (let i = 0; i < ariaOpts.length; i++) {
+                const optText = ariaOpts[i].textContent.trim().toLowerCase();
+                if (optText === lowerVal || optText.includes(lowerVal)) {
+                  optionIndex = i;
+                  console.log(`[WebSense FILL DEBUG]   combobox: MATCHED in ARIA at index ${i}: "${ariaOpts[i].textContent.trim()}"`);
+                  break;
+                }
+              }
+            }
+          }
+
+          // Step B: Snapshot which option-like elements are ALREADY visible
+          //         so after opening we can detect NEW ones
+          const snapshotVisibleOptions = () => {
+            const vis = new Set();
+            for (const o of document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [data-value]')) {
+              const r = o.getBoundingClientRect();
+              if (r.width > 0 && r.height > 0) vis.add(o);
+            }
+            return vis;
+          };
+          const beforeOpen = snapshotVisibleOptions();
+
+          // Step C: Click/focus the combobox to open the dropdown
+          element.focus();
+          simulateRealClick(element);
+          console.log(`[WebSense FILL DEBUG]   combobox: Opened dropdown, scanning for visible options...`);
+
+          // Step D: Universal visible-option finder
+          //   Scans the ENTIRE DOM for visible elements matching our target text.
+          //   Works with React portals, position:fixed overlays, shadow DOM, etc.
+          const findVisibleOption = (strict) => {
+            // Selectors for option-like elements across all frameworks
+            const optionSelectors = [
+              '[role="option"]',
+              '[role="menuitem"]',
+              '[role="menuitemradio"]',
+              '[role="treeitem"]',
+              '[data-value]',
+              'li[id]',                    // Headless UI / custom lists
+              '.option',                   // Generic CSS class
+              '[class*="option"]',         // Class contains "option"
+              '[class*="menu-item"]',      // Menu items
+              '[class*="select-item"]',    // Custom select items
+              '[class*="dropdown-item"]',  // Bootstrap dropdown items
+              '[class*="listbox-option"]', // Listbox pattern
+            ];
+            const candidates = new Set();
+            for (const sel of optionSelectors) {
+              try {
+                for (const el of document.querySelectorAll(sel)) {
+                  candidates.add(el);
+                }
+              } catch { /* invalid selector */ }
+            }
+
+            // Also check any NEW visible elements that appeared after opening
+            for (const o of document.querySelectorAll('[role="option"], [role="menuitem"], [data-value]')) {
+              if (!beforeOpen.has(o)) candidates.add(o);
+            }
+
+            // Score and match candidates
+            let bestMatch = null;
+            let bestScore = 0;
+            for (const opt of candidates) {
+              const rect = opt.getBoundingClientRect();
+              if (rect.width <= 0 || rect.height <= 0) continue; // invisible
+              const text = opt.textContent.trim().toLowerCase();
+              const dataVal = (opt.getAttribute('data-value') || '').toLowerCase();
+
+              let score = 0;
+              if (text === lowerVal || dataVal === lowerVal) score = 10; // exact
+              else if (text === lowerVal.replace(/^0+/, '') || dataVal === lowerVal.replace(/^0+/, '')) score = 9; // leading zeros
+              else if (!strict && lowerVal.length > 1 && (text.includes(lowerVal) || dataVal.includes(lowerVal))) score = 5; // contains
+              else if (!strict && lowerVal.length > 1 && (text.startsWith(lowerVal) || dataVal.startsWith(lowerVal))) score = 4; // starts with
+
+              if (score > bestScore) {
+                bestScore = score;
+                bestMatch = opt;
+              }
+            }
+            return bestMatch;
+          };
+
+          // Also search inside popup containers for leaf text nodes
+          const findInPopupLayers = () => {
+            const layerSelectors = [
+              '[role="listbox"]', '[role="menu"]', '[role="dialog"]',
+              '[role="presentation"]', '[data-testid]',
+              '[style*="position: fixed"]', '[style*="position: absolute"]',
+              '[class*="dropdown"]', '[class*="popup"]', '[class*="popover"]',
+              '[class*="overlay"]', '[class*="portal"]', '[class*="menu"]',
+            ];
+            for (const sel of layerSelectors) {
+              try {
+                for (const layer of document.querySelectorAll(sel)) {
+                  const walker = document.createTreeWalker(layer, NodeFilter.SHOW_ELEMENT);
+                  let node;
+                  while ((node = walker.nextNode())) {
+                    if (node.children.length > 0) continue; // leaf nodes only
+                    const rect = node.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) continue;
+                    const text = node.textContent.trim().toLowerCase();
+                    if (text === lowerVal) return node;
+                  }
+                }
+              } catch { /* skip */ }
+            }
+            return null;
+          };
+
+          // Step E: Poll up to 2s for the visual option to appear after opening
+          const pollStart = Date.now();
+          let visibleOpt = null;
+          for (let attempt = 0; attempt < 20; attempt++) {
+            await new Promise(r => setTimeout(r, 100));
+            // Try strict match first, then loose
+            visibleOpt = findVisibleOption(true) || findVisibleOption(false) || findInPopupLayers();
+            if (visibleOpt) {
+              const vr = visibleOpt.getBoundingClientRect();
+              console.log(`[WebSense FILL DEBUG]   combobox: FOUND visible "${visibleOpt.textContent.trim()}" at (${Math.round(vr.left + vr.width/2)},${Math.round(vr.top + vr.height/2)}) in ${Date.now() - pollStart}ms [tag=${visibleOpt.tagName}, role=${visibleOpt.getAttribute('role')}, class=${(visibleOpt.className || '').toString().substring(0, 60)}]`);
+              break;
+            }
+          }
+
+          if (visibleOpt) {
+            // Step F: Click the visible option
+            visibleOpt.scrollIntoView({ block: 'nearest' });
+            await new Promise(r => setTimeout(r, 30));
+            simulateRealClick(visibleOpt);
+            await new Promise(r => setTimeout(r, 80));
+            if (visibleOpt.getAttribute('role') === 'option') {
+              visibleOpt.setAttribute('aria-selected', 'true');
+            }
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+            matched = true;
+            console.log(`[WebSense FILL DEBUG]   combobox: Clicked visible option ✅`);
+          } else {
+            // Step G: Keyboard fallback — universal across frameworks
+            console.warn(`[WebSense FILL DEBUG]   combobox: No visible option after ${Date.now() - pollStart}ms — using keyboard navigation`);
+            element.focus();
+
+            if (optionIndex >= 0) {
+              // Navigate by ArrowDown to the correct index, then Enter
+              console.log(`[WebSense FILL DEBUG]   combobox keyboard: ArrowDown x${optionIndex + 1} then Enter`);
+              for (let k = 0; k <= optionIndex; k++) {
+                element.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, which: 40, bubbles: true, cancelable: true }));
+                element.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, which: 40, bubbles: true }));
+                await new Promise(r => setTimeout(r, 40));
+              }
+              await new Promise(r => setTimeout(r, 80));
+              element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+              element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+              matched = true;
+              console.log(`[WebSense FILL DEBUG]   combobox keyboard: Sent ✅`);
+            } else {
+              // No ARIA index — try typing the value to filter, then Enter
+              console.log(`[WebSense FILL DEBUG]   combobox keyboard: Typing "${value}" to filter`);
+              for (const char of value) {
+                element.dispatchEvent(new KeyboardEvent('keydown', { key: char, code: `Key${char.toUpperCase()}`, bubbles: true, cancelable: true }));
+                element.dispatchEvent(new KeyboardEvent('keypress', { key: char, code: `Key${char.toUpperCase()}`, bubbles: true, cancelable: true }));
+                element.dispatchEvent(new InputEvent('input', { data: char, inputType: 'insertText', bubbles: true }));
+                element.dispatchEvent(new KeyboardEvent('keyup', { key: char, code: `Key${char.toUpperCase()}`, bubbles: true }));
+                await new Promise(r => setTimeout(r, 50));
+              }
+              await new Promise(r => setTimeout(r, 200));
+              // Select first visible result via Enter
+              element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+              element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+              matched = true;
+              console.log(`[WebSense FILL DEBUG]   combobox keyboard: Typed + Enter ✅`);
+            }
+          }
+        }
       } else {
-        element.value = value;
+        branchTaken = 'generic-fallback';
+        const elRole = element.getAttribute && element.getAttribute('role');
+        const elTag = element.tagName;
+        console.log(`[WebSense FILL DEBUG]   Branch: GENERIC FALLBACK — tagName=${elTag}, type=${element.type}, role=${elRole}`);
+        // Intelligent fallback: try the best approach for this element
+        try {
+          element.focus();
+          if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+            // Standard input/textarea that somehow ended up here
+            const setter = element instanceof HTMLInputElement ? nativeInputValueSetter : nativeTextAreaValueSetter;
+            if (setter) {
+              setter.call(element, value);
+            } else {
+              element.value = value;
+            }
+            triggerReactChange(element);
+          } else if (element.getAttribute && element.getAttribute('contenteditable') === 'true') {
+            // Contenteditable
+            element.textContent = '';
+            document.execCommand('insertText', false, value);
+          } else if ('value' in element) {
+            element.value = value;
+            triggerReactChange(element);
+          } else {
+            element.textContent = value;
+            element.dispatchEvent(new Event('input', { bubbles: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        } catch (e) {
+          console.warn(`[WebSense FILL DEBUG]   generic-fallback error:`, e);
+          try { element.textContent = value; } catch { /* last resort */ }
+        }
       }
 
-      // Dispatch events for React/Vue/Angular compatibility
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-      element.dispatchEvent(new Event('blur', { bubbles: true }));
+      console.log(`%c[WebSense FILL DEBUG]   ✅ DONE field "${fieldName}" — branch: ${branchTaken}`, 'color: #00CC00;');
+
+      } catch (fillError) {
+        console.error(`[WebSense FILL DEBUG]   ❌ ERROR filling "${fieldName}" in branch "${branchTaken}":`, fillError);
+        console.error(`[WebSense FILL DEBUG]   Error stack:`, fillError.stack);
+      }
 
       // Visual highlight with animation
       addFillHighlight(element, confidence);
@@ -639,25 +1206,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    const fillReport = fillFormFields(fieldsToFill);
-
-    // Show confirmation panel with actual summary
-    const displaySummary = summary || {};
-    // If summary is empty, build it from fieldsToFill
-    if (Object.keys(displaySummary).length === 0) {
-      for (const [fieldName, fieldData] of Object.entries(fieldsToFill)) {
-        displaySummary[fieldName] = typeof fieldData === 'object' ? fieldData.value : fieldData;
+    // fillFormFields is async (combobox click-wait-click needs await)
+    // Chrome message listeners need `return true` to keep port open for async sendResponse
+    fillFormFields(fieldsToFill).then((fillReport) => {
+      // Show confirmation panel with actual summary
+      const displaySummary = summary || {};
+      if (Object.keys(displaySummary).length === 0) {
+        for (const [fieldName, fieldData] of Object.entries(fieldsToFill)) {
+          displaySummary[fieldName] = typeof fieldData === 'object' ? fieldData.value : fieldData;
+        }
       }
-    }
 
-    showFillConfirmationPanel(displaySummary, fillReport);
+      showFillConfirmationPanel(displaySummary, fillReport);
 
-    sendResponse({
-      success: true,
-      filled: fillReport.filled,
-      notFound: fillReport.notFound,
+      sendResponse({
+        success: true,
+        filled: fillReport?.filled || [],
+        notFound: fillReport?.notFound || [],
+      });
+    }).catch((err) => {
+      console.error('[WebSense FILL] fillFormFields error:', err);
+      sendResponse({ success: false, error: err.message });
     });
-    return;
+
+    return true; // Keep message channel open for async sendResponse
   }
 
   /**

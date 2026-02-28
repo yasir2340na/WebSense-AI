@@ -123,10 +123,32 @@ RULES:
 - You will be given a list of "page_fields" — these are the ACTUAL input fields on the page.
   Each page field has: name, id, placeholder, label, autocomplete, type.
 - IMPORTANT: Use the field's LABEL, PLACEHOLDER, and AUTOCOMPLETE attributes to understand
-  what each field is for (e.g. "First Name", "Email", "Phone"). Do NOT fill fields positionally
-  from top to bottom — match SEMANTICALLY based on meaning.
+  what each field is for (e.g. "First Name", "Email", "Phone", "Activity Name", "Category").
+  Do NOT fill fields positionally from top to bottom — match SEMANTICALLY based on meaning.
 - Extract values ONLY for fields that exist on the page.
-- Use the page field's "name" or "id" as the key in extracted_fields.
+- Use the page field's "name" or "id" (from "key_to_use") as the key in extracted_fields.
+- The transcript may use the pattern "[current field: <label>] <user input>". The bracket
+  prefix tells you which field the user is answering. Extract the VALUE from the user input
+  and map it to the page field whose label matches. For example:
+  * "[current field: Enter Your Name] my name is Yasir Ali" → extract "Yasir Ali" for the name field.
+  * "[current field: Enter Your Email] test@example.com" → extract "test@example.com" for the email field.
+  * "[current field: Activity Name] reading" → extract "reading" for the activity name field.
+- The transcript may also use the pattern "<field label> is <value>". Map the label to the
+  correct page field key and extract the value.
+- For date fields: interpret natural language like "today", "yesterday", "tomorrow" into
+  actual dates in YYYY-MM-DD format. Use the current date context if provided.
+- For number fields (type "number"): extract only numeric values.
+- For select/dropdown fields: the transcript may include "(available options: ...)" which lists
+  valid option values. You MUST match the user's input to one of those available options.
+  For example, if the user says "15" and the available options are "1, 2, 3, ..., 31",
+  return "15". If the user says "January" and options are "Jan, Feb, ...", return "Jan".
+  If the user says "female" and options are "Female, Male, Custom", return "Female".
+  Always return the EXACT option value, not the user's raw input.
+- For radio-group fields: same as dropdowns — match user input to the closest option.
+- CRITICAL: Extract ONLY the user's intended value, NOT the field label or surrounding context.
+  For example, "my name is Yasir Ali" → extract "Yasir Ali", NOT "my name is Yasir Ali".
+- If the user spells out letters separated by spaces (e.g. "n a i c h" or "N A I C H"),
+  join them into a single word: "Naich". Apply title case for name fields.
 - Return a JSON object with this exact structure:
 {
   "extracted_fields": {
@@ -141,12 +163,12 @@ RULES:
   "clarification_question": "What is your email address?"
 }
 
-- Use the field's name or id EXACTLY as provided in page_fields.
+- Use the field's name or id EXACTLY as provided in page_fields (the "key_to_use" value).
 - Match values to fields by their MEANING, not their position:
-  * If a field has label "First Name" and the user says "my first name is Yasir Ali",
-    put "Yasir Ali" in that field (not split across fields).
-  * If a field has label "Last Name" and the user says "last name is naich",
-    put "naich" in the Last Name field.
+  * If a field has label "Activity Name" and the user says "activity name is reading",
+    put "reading" in that field using the field's key_to_use.
+  * If a field has label "Hours" (type number) and the user says "about 2 hours",
+    extract "2" as the value.
   * Always look at label, placeholder, aria-label, and autocomplete to determine field purpose.
 - Confidence should be 0.0-1.0 based on how certain you are.
 - missing_fields lists required page fields the user has NOT provided values for.
@@ -265,23 +287,34 @@ def extract_node(state: WebSenseState) -> dict[str, Any]:
     # Fast-path: local regex extraction first to avoid LLM latency on common phrases.
     # This keeps the chat responsive for inputs like:
     # "my first name is Yasir", "email is a@b.com", "phone is ...".
+    # IMPORTANT: Only use fast-path if regex keys match actual page field keys.
     quick_fields = _regex_fallback_extract(sanitized_transcript)
     if quick_fields:
-        merged_fields = {**existing_fields, **quick_fields}
+        # Validate that regex-extracted keys actually exist on the page
+        page_keys = set()
+        for pf in page_fields:
+            pk = pf.get("name", "") or pf.get("id", "")
+            if pk:
+                page_keys.add(pk.lower())
+        matched_quick = {k: v for k, v in quick_fields.items() if k.lower() in page_keys}
+        if matched_quick:
+            merged_fields = {**existing_fields, **matched_quick}
 
-        conversation_history = conversation_history.copy()
-        conversation_history.append({
-            "turn": state.get("turn_count", 1),
-            "role": "assistant",
-            "content": f"Fast-extracted: {list(quick_fields.keys())}",
-        })
+            conversation_history = conversation_history.copy()
+            conversation_history.append({
+                "turn": state.get("turn_count", 1),
+                "role": "assistant",
+                "content": f"Fast-extracted: {list(matched_quick.keys())}",
+            })
 
-        return {
-            "extracted_fields": merged_fields,
-            "missing_fields": [f.get("name", "") or f.get("id", "") for f in page_fields if (f.get("name", "") or f.get("id", "")) not in merged_fields],
-            "conversation_history": conversation_history,
-            "error_message": "",
-        }
+            return {
+                "extracted_fields": merged_fields,
+                "missing_fields": [f.get("name", "") or f.get("id", "") for f in page_fields if (f.get("name", "") or f.get("id", "")) not in merged_fields],
+                "conversation_history": conversation_history,
+                "extraction_method": "regex",
+                "error_message": "",
+            }
+        # If regex keys don't match page fields, fall through to LLM
 
     # Build field context for the LLM — give it full page field details
     # Emphasize the label/meaning to help semantic matching
@@ -358,6 +391,7 @@ def extract_node(state: WebSenseState) -> dict[str, Any]:
             "extracted_fields": merged_fields,
             "missing_fields": missing,
             "conversation_history": conversation_history,
+            "extraction_method": "cohere_llm",
             "error_message": "",
         }
 
@@ -369,6 +403,7 @@ def extract_node(state: WebSenseState) -> dict[str, Any]:
         return {
             "extracted_fields": merged_fields,
             "missing_fields": [f.get("name", "") or f.get("id", "") for f in page_fields],
+            "extraction_method": "regex_fallback",
             "error_message": f"LLM extraction failed: {str(e)}",
         }
 
@@ -625,6 +660,8 @@ def review_node(state: WebSenseState) -> dict[str, Any]:
 
     speak = f"I captured {field_count} fields. Should I fill these? Say yes to fill or no to correct."
 
+    extraction_method = state.get("extraction_method", "unknown")
+
     return {
         "conversation_phase": "confirming",
         "bot_response": {
@@ -633,6 +670,7 @@ def review_node(state: WebSenseState) -> dict[str, Any]:
             "fields_summary": {_pretty(k, label_map): v for k, v in summary_dict.items()},
             "summary": summary_dict,
             "missing_fields": [_pretty(f, label_map) for f in missing_fields],
+            "extraction_method": extraction_method,
             "speak_text": speak,
             "status_text": "Waiting for confirmation…",
         },

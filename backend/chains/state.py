@@ -101,6 +101,9 @@ class WebSenseState(TypedDict, total=False):
     correcting_field_key: str     # Raw field key being corrected
     spelling_buffer: str          # Accumulated letters during spelling
 
+    # --- Extraction Metadata ---
+    extraction_method: str        # "regex" | "cohere_llm" | "regex_fallback"
+
     # --- Response ---
     bot_response: BotResponse     # Structured response for Chrome extension
     error_message: str
